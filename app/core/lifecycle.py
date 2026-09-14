@@ -13,6 +13,7 @@ from app.observability.metrics import get_metrics
 from app.quota.tracker import get_quota_tracker
 from app.reliability.circuit_breaker import CircuitBreakerRegistry
 from app.reliability.health import HealthMonitor
+from app.routing.performance_controller import PerformanceController
 from app.routing.router import AdaptiveRouter
 from app.routing.scheduler import ConcurrencyLimiter
 from app.storage.database import Database
@@ -46,13 +47,19 @@ async def startup(settings: Settings | None = None) -> AppContext:
     for pid, pcfg in settings.providers.items():
         limiter.configure_provider(pid, pcfg.max_concurrency)
 
-    router = AdaptiveRouter(providers, models, circuits, quota, default_policy=settings.routing.default_policy)
-    cache = CacheManager(settings.cache, db_path)
-
     provider_repo = ProviderRepository(db)
     model_repo = ModelRepository(db)
     request_repo = RequestRepository(db)
     metrics_repo = MetricsRepository(db)
+
+    performance = PerformanceController(metrics_repo=metrics_repo, events=events, snapshot_interval_seconds=60.0)
+    performance.start()
+
+    router = AdaptiveRouter(
+        providers, models, circuits, quota,
+        default_policy=settings.routing.default_policy, performance_controller=performance,
+    )
+    cache = CacheManager(settings.cache, db_path)
 
     for pid, pcfg in settings.providers.items():
         await provider_repo.upsert(pid, pcfg.name, pcfg.type, providers.is_enabled(pid))
@@ -70,12 +77,13 @@ async def startup(settings: Settings | None = None) -> AppContext:
         settings=settings, providers=providers, models=models, circuits=circuits, quota=quota,
         router=router, limiter=limiter, cache=cache, metrics=metrics, events=events, db=db,
         provider_repo=provider_repo, model_repo=model_repo, request_repo=request_repo,
-        metrics_repo=metrics_repo, health_monitor=health_monitor,
+        metrics_repo=metrics_repo, health_monitor=health_monitor, performance=performance,
     )
 
 
 async def shutdown(ctx: AppContext) -> None:
     logger.info("shutdown starting")
     await ctx.health_monitor.stop()
+    await ctx.performance.stop()
     await ctx.providers.close_all()
     logger.info("shutdown complete")

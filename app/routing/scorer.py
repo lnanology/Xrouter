@@ -27,6 +27,9 @@ class ScoreInput:
     quota_risk: QuotaRisk
     requires_streaming: bool = False
     requires_tools: bool = False
+    # Phase 2: observed-performance weight from PerformanceController.
+    # 1.0 (neutral) until it has enough samples to have an opinion.
+    performance_weight: float = 1.0
 
 
 def _availability_score(health: ProviderHealth, circuit_state: CircuitState) -> float:
@@ -84,5 +87,10 @@ def score_candidate(inp: ScoreInput, weights: PolicyWeights, is_local: bool) -> 
     # Latency penalty: gently discourage slow providers without hard-excluding them.
     if inp.provider_health.latency_ms:
         score *= 1.0 / (1.0 + (inp.provider_health.latency_ms / 2000.0))
+
+    # Phase 2: fold in observed performance trend (gated by min sample count
+    # inside PerformanceController itself, so this is a no-op — multiplier
+    # 1.0 — until there's enough real telemetry to trust).
+    score *= inp.performance_weight
 
     return max(score, 0.0)

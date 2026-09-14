@@ -24,6 +24,7 @@ from app.execution.async_executor import execute_attempt
 from app.quota.tracker import QuotaTracker
 from app.reliability.circuit_breaker import CircuitBreakerRegistry
 from app.reliability.retry import RetryConfig, retry_with_backoff
+from app.routing.performance_controller import PerformanceController
 from app.routing.scheduler import ConcurrencyLimiter
 
 AttemptHook = Callable[[dict[str, Any]], None]
@@ -42,6 +43,7 @@ async def run_chat(
     request: ChatCompletionRequest,
     max_attempts: int,
     on_attempt: AttemptHook | None = None,
+    performance: PerformanceController | None = None,
 ) -> tuple[ChatCompletionResponse, list[dict]]:
     attempts_log: list[dict] = []
     for idx, candidate in enumerate(_candidates(decision)[:max_attempts]):
@@ -65,6 +67,8 @@ async def run_chat(
             breaker.record_success()
             quota.record_success(candidate.provider_id)
             quota.record_tokens(candidate.provider_id, response.usage.total_tokens)
+            if performance is not None:
+                performance.record(candidate.provider_id, latency_ms, success=True)
             response.xrouter = {
                 "provider": candidate.provider_id,
                 "model": candidate.model_id,
@@ -82,6 +86,8 @@ async def run_chat(
             breaker.record_failure()
             if isinstance(e, ProviderRateLimitError):
                 quota.record_rate_limit(candidate.provider_id, e.retry_after)
+            if performance is not None:
+                performance.record(candidate.provider_id, latency_ms, success=False)
             attempt = {
                 "provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "failed",
                 "latency_ms": latency_ms, "error": str(e),
@@ -103,6 +109,7 @@ async def run_stream_chat(
     request: ChatCompletionRequest,
     max_attempts: int,
     on_attempt: AttemptHook | None = None,
+    performance: PerformanceController | None = None,
 ) -> AsyncIterator[ChatCompletionChunk]:
     """Falls back to the next candidate only if the *first* chunk fails to
     arrive. Once streaming has started and content has been sent to the
@@ -133,6 +140,8 @@ async def run_stream_chat(
             breaker.record_failure()
             if isinstance(e, ProviderRateLimitError):
                 quota.record_rate_limit(candidate.provider_id, e.retry_after)
+            if performance is not None:
+                performance.record(candidate.provider_id, (time.time() - start) * 1000, success=False)
             last_error = e
             attempt = {"provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "failed", "error": str(e)}
             attempts_log.append(attempt)
@@ -143,9 +152,12 @@ async def run_stream_chat(
         # First chunk arrived: commit to this provider for the rest of the stream.
         breaker.record_success()
         quota.record_success(candidate.provider_id)
+        first_chunk_latency_ms = (time.time() - start) * 1000
+        if performance is not None:
+            performance.record(candidate.provider_id, first_chunk_latency_ms, success=True)
         attempt = {
             "provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "success",
-            "latency_ms": (time.time() - start) * 1000,
+            "latency_ms": first_chunk_latency_ms,
         }
         attempts_log.append(attempt)
         if on_attempt:

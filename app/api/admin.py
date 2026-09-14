@@ -38,6 +38,7 @@ async def admin_metrics(request: Request):
         "metrics": ctx.metrics.snapshot(),
         "quota": ctx.quota.snapshot(),
         "circuit_breakers": {k: v.snapshot() for k, v in ctx.circuits.all().items()},
+        "performance": ctx.performance.snapshot(),
     }
 
 

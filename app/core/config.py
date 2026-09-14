@@ -43,6 +43,12 @@ class RoutingConfig:
     default_policy: str = "balanced"
     max_fallback_attempts: int = 3
     race_mode_enabled: bool = False
+    # Phase 2: when true, an unspecified client `routing_policy` is chosen
+    # by the Task Classifier (task type + complexity) instead of always
+    # falling back to `default_policy`. `default_policy` is still used when
+    # this is false, and still wins for any task type the classifier can't
+    # place confidently.
+    task_aware_policy: bool = True
 
 
 @dataclass
@@ -92,6 +98,7 @@ class Settings:
             default_policy=routing_raw.get("default_policy", "balanced"),
             max_fallback_attempts=int(routing_raw.get("max_fallback_attempts", 3)),
             race_mode_enabled=bool(routing_raw.get("race_mode_enabled", False)),
+            task_aware_policy=bool(routing_raw.get("task_aware_policy", True)),
         )
 
         cache_raw = raw_config.get("cache", {})

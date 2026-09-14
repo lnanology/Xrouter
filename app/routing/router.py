@@ -13,6 +13,7 @@ from app.core.registry import ModelRegistry, ProviderRegistry
 from app.quota.tracker import QuotaTracker
 from app.reliability.circuit_breaker import CircuitBreakerRegistry
 from app.routing import policies as _policies_pkg  # noqa: F401  (documents location)
+from app.routing.performance_controller import PerformanceController
 from app.routing.policies import balanced, cheapest, fastest, quality, quota_aware, reliable
 from app.routing.scorer import ScoreInput, score_candidate
 
@@ -36,12 +37,16 @@ class AdaptiveRouter:
         circuit_breakers: CircuitBreakerRegistry,
         quota_tracker: QuotaTracker,
         default_policy: str = "balanced",
+        performance_controller: PerformanceController | None = None,
     ):
         self._providers = provider_registry
         self._models = model_registry
         self._circuits = circuit_breakers
         self._quota = quota_tracker
         self._default_policy = default_policy
+        # Optional: a router built without one (e.g. in unit tests) simply
+        # never applies a performance weight — every candidate stays neutral.
+        self._performance = performance_controller
 
     def resolve_policy(self, name: str | None) -> tuple[str, PolicyWeights]:
         key = (name or self._default_policy).lower()
@@ -76,6 +81,7 @@ class AdaptiveRouter:
             circuit = self._circuits.get(model.provider_id)
             quota_risk = self._quota.risk(model.provider_id)
             is_local = provider.config.type in LOCAL_PROVIDER_TYPES
+            performance_weight = self._performance.weight_multiplier(model.provider_id) if self._performance else 1.0
 
             score = score_candidate(
                 ScoreInput(
@@ -85,6 +91,7 @@ class AdaptiveRouter:
                     quota_risk=quota_risk,
                     requires_streaming=request.stream,
                     requires_tools=bool(request.tools),
+                    performance_weight=performance_weight,
                 ),
                 weights,
                 is_local,

@@ -12,8 +12,8 @@ from app.contracts.request import ChatCompletionRequest
 from app.contracts.response import ChatCompletionChunk, ChatCompletionResponse
 from app.core.context import AppContext
 from app.core.errors import NoAvailableModelError
+from app.intelligence.task_classifier import TaskClassification, classify
 from app.observability.logging import get_logger
-from app.routing.classifier import classify_complexity
 from app.routing.fallback import run_chat, run_stream_chat
 from app.utils.ids import new_id
 from app.storage.repositories.request import RequestRecord
@@ -25,11 +25,24 @@ class ChatEngine:
     def __init__(self, ctx: AppContext):
         self.ctx = ctx
 
+    def _resolve_policy(self, request: ChatCompletionRequest, classification: TaskClassification) -> str:
+        """A client-supplied routing_policy always wins. Otherwise, if the
+        Task Classifier is enabled (section 三十六 Phase 2), use its
+        suggestion; else fall back to the static Phase 1 default_policy."""
+        if request.routing_policy:
+            return request.routing_policy
+        if self.ctx.settings.routing.task_aware_policy:
+            return classification.suggested_policy
+        return self.ctx.settings.routing.default_policy
+
     async def handle_chat(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         request_id = new_id("req")
-        complexity = classify_complexity(request)
-        policy = request.routing_policy or self.ctx.settings.routing.default_policy
-        record = RequestRecord(request_id=request_id, task_type="chat", complexity=complexity, routing_policy=policy)
+        classification = classify(request)
+        policy = self._resolve_policy(request, classification)
+        record = RequestRecord(
+            request_id=request_id, task_type=classification.task_type.value,
+            complexity=classification.complexity, routing_policy=policy,
+        )
         start = time.time()
 
         cache_key = None
@@ -67,6 +80,7 @@ class ChatEngine:
             response, attempts = await run_chat(
                 decision, self.ctx.providers, self.ctx.circuits, self.ctx.quota, self.ctx.limiter,
                 request, self.ctx.settings.routing.max_fallback_attempts, on_attempt=_on_attempt,
+                performance=self.ctx.performance,
             )
         except NoAvailableModelError as e:
             record.status = "failed"
@@ -108,9 +122,12 @@ class ChatEngine:
 
     async def handle_stream_chat(self, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
         request_id = new_id("req")
-        complexity = classify_complexity(request)
-        policy = request.routing_policy or self.ctx.settings.routing.default_policy
-        record = RequestRecord(request_id=request_id, task_type="chat.stream", complexity=complexity, routing_policy=policy)
+        classification = classify(request)
+        policy = self._resolve_policy(request, classification)
+        record = RequestRecord(
+            request_id=request_id, task_type=classification.task_type.value,
+            complexity=classification.complexity, routing_policy=policy,
+        )
         start = time.time()
         first_token_at: float | None = None
         total_chunks = 0
@@ -135,6 +152,7 @@ class ChatEngine:
             async for chunk in run_stream_chat(
                 decision, self.ctx.providers, self.ctx.circuits, self.ctx.quota, self.ctx.limiter,
                 request, self.ctx.settings.routing.max_fallback_attempts, on_attempt=_on_attempt,
+                performance=self.ctx.performance,
             ):
                 if first_token_at is None:
                     first_token_at = time.time()

@@ -13,6 +13,10 @@ providers:
     type: ollama
     enabled: true
     base_url: "http://localhost:11434"
+    # Local reasoning models (e.g. qwen3) can take well over a minute on
+    # CPU-only hardware even for a trivial prompt — give it real headroom
+    # rather than timing out and burning retries on a model that was simply
+    # still thinking.
     timeout_seconds: 300
     max_concurrency: 2
     priority: 100

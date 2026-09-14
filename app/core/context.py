@@ -14,6 +14,7 @@ from app.observability.metrics import MetricsCollector
 from app.quota.tracker import QuotaTracker
 from app.reliability.circuit_breaker import CircuitBreakerRegistry
 from app.reliability.health import HealthMonitor
+from app.routing.performance_controller import PerformanceController
 from app.routing.router import AdaptiveRouter
 from app.routing.scheduler import ConcurrencyLimiter
 from app.storage.database import Database
@@ -41,3 +42,4 @@ class AppContext:
     request_repo: RequestRepository
     metrics_repo: MetricsRepository
     health_monitor: HealthMonitor
+    performance: PerformanceController
