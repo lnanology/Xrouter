@@ -17,7 +17,7 @@ def cache_manager():
         from app.storage.database import Database
 
         db = Database(db_path)
-        asyncio.get_event_loop().run_until_complete(db.init())
+        asyncio.run(db.init())
         yield CacheManager(CacheConfig(enabled=True, l1_max_entries=10, default_ttl_seconds=60), db_path)
 
 

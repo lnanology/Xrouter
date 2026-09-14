@@ -46,7 +46,18 @@ def test_v1_models_returns_list_shape(client):
     assert isinstance(body["data"], list)
 
 
+def _disable_all_providers(client):
+    """Force a genuine 'no providers available' state. We cannot rely on the
+    test machine simply lacking Ollama/cloud keys (e.g. a dev's real Mac may
+    have Ollama installed and running), so explicitly disable every
+    configured provider on this test's own AppContext instead."""
+    ctx = app.state.context
+    for pid in ctx.providers.all():
+        ctx.providers.set_enabled(pid, False)
+
+
 def test_chat_completions_structured_error_when_no_providers(client):
+    _disable_all_providers(client)
     resp = client.post("/v1/chat/completions", json={"model": "auto", "messages": [{"role": "user", "content": "hi"}]})
     assert resp.status_code == 503
     body = resp.json()
@@ -55,6 +66,7 @@ def test_chat_completions_structured_error_when_no_providers(client):
 
 
 def test_streaming_structured_error_when_no_providers(client):
+    _disable_all_providers(client)
     with client.stream(
         "POST", "/v1/chat/completions",
         json={"model": "auto", "messages": [{"role": "user", "content": "hi"}], "stream": True},
