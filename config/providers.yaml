@@ -1,0 +1,53 @@
+# Every provider goes through the same Adapter interface (app/providers/base.py).
+# `type` selects the adapter (see app/providers/factory.py). Add a new provider
+# by adding an entry here — no code changes required as long as its API is
+# OpenAI-compatible (use type: openai_compatible).
+#
+# API keys are NEVER written here — only the *name* of the environment
+# variable that holds the key (read from .env). A provider missing its key
+# disables itself gracefully; it never crashes the server.
+
+providers:
+  ollama:
+    name: "Ollama (local)"
+    type: ollama
+    enabled: true
+    base_url: "http://localhost:11434"
+    timeout_seconds: 60
+    max_concurrency: 2
+    priority: 100
+
+  groq:
+    name: "Groq"
+    type: groq
+    enabled: false
+    api_key_env: "GROQ_API_KEY"
+    timeout_seconds: 30
+    max_concurrency: 4
+    priority: 50
+
+  openrouter:
+    name: "OpenRouter"
+    type: openrouter
+    enabled: false
+    api_key_env: "OPENROUTER_API_KEY"
+    timeout_seconds: 30
+    max_concurrency: 4
+    priority: 40
+
+  gemini:
+    name: "Google Gemini"
+    type: gemini
+    enabled: false
+    api_key_env: "GEMINI_API_KEY"
+    timeout_seconds: 30
+    max_concurrency: 4
+    priority: 30
+
+  # Example of a self-hosted / third-party OpenAI-compatible endpoint.
+  # openai_compatible_custom:
+  #   name: "My OpenAI-compatible endpoint"
+  #   type: openai_compatible
+  #   enabled: false
+  #   base_url: "https://api.example.com/v1"
+  #   api_key_env: "CUSTOM_API_KEY"

@@ -1,0 +1,142 @@
+"""Config-driven settings. All provider/model/routing config comes from
+config/*.yaml; secrets come from environment variables (.env). Nothing is
+hardcoded in code."""
+from __future__ import annotations
+
+import logging
+import os
+import secrets
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+from dotenv import load_dotenv
+
+from app.contracts.provider import ProviderConfig
+
+CONFIG_DIR = Path(os.environ.get("XROUTER_CONFIG_DIR", Path(__file__).resolve().parents[2] / "config"))
+DATA_DIR = Path(os.environ.get("XROUTER_DATA_DIR", Path(__file__).resolve().parents[2] / "data"))
+
+
+def _load_yaml(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    with path.open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+@dataclass
+class ServerConfig:
+    host: str = "0.0.0.0"
+    port: int = 20128
+    admin_token: str | None = None
+    cors_origins: list[str] = field(default_factory=lambda: ["*"])
+    request_timeout_seconds: float = 60.0
+    max_request_body_bytes: int = 5_000_000
+    global_concurrency_limit: int = 64
+    per_client_rate_limit_per_minute: int = 120
+
+
+@dataclass
+class RoutingConfig:
+    default_policy: str = "balanced"
+    max_fallback_attempts: int = 3
+    race_mode_enabled: bool = False
+
+
+@dataclass
+class CacheConfig:
+    enabled: bool = True
+    l1_max_entries: int = 512
+    default_ttl_seconds: float = 300.0
+    volatile_keywords: list[str] = field(
+        default_factory=lambda: ["today", "now", "current", "latest", "news", "price", "stock", "weather"]
+    )
+
+
+@dataclass
+class Settings:
+    server: ServerConfig
+    routing: RoutingConfig
+    cache: CacheConfig
+    providers: dict[str, ProviderConfig]
+    raw_routing: dict[str, Any]
+    model_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    @classmethod
+    def load(cls, config_dir: Path | None = None) -> "Settings":
+        load_dotenv()  # loads .env into os.environ if present; no-op otherwise
+        cdir = config_dir or CONFIG_DIR
+
+        raw_config = _load_yaml(cdir / "config.yaml")
+        raw_providers = _load_yaml(cdir / "providers.yaml")
+        raw_routing = _load_yaml(cdir / "routing.yaml")
+        raw_models = _load_yaml(cdir / "models.yaml")
+        model_overrides = raw_models.get("models", {}) or {}
+
+        server_raw = raw_config.get("server", {})
+        server = ServerConfig(
+            host=server_raw.get("host", ServerConfig.host),
+            port=int(server_raw.get("port", ServerConfig.port)),
+            admin_token=server_raw.get("admin_token") or os.environ.get("XROUTER_ADMIN_TOKEN"),
+            cors_origins=server_raw.get("cors_origins", ["*"]),
+            request_timeout_seconds=float(server_raw.get("request_timeout_seconds", 60.0)),
+            max_request_body_bytes=int(server_raw.get("max_request_body_bytes", 5_000_000)),
+            global_concurrency_limit=int(server_raw.get("global_concurrency_limit", 64)),
+            per_client_rate_limit_per_minute=int(server_raw.get("per_client_rate_limit_per_minute", 120)),
+        )
+
+        routing_raw = raw_routing.get("routing", {})
+        routing = RoutingConfig(
+            default_policy=routing_raw.get("default_policy", "balanced"),
+            max_fallback_attempts=int(routing_raw.get("max_fallback_attempts", 3)),
+            race_mode_enabled=bool(routing_raw.get("race_mode_enabled", False)),
+        )
+
+        cache_raw = raw_config.get("cache", {})
+        cache = CacheConfig(
+            enabled=bool(cache_raw.get("enabled", True)),
+            l1_max_entries=int(cache_raw.get("l1_max_entries", 512)),
+            default_ttl_seconds=float(cache_raw.get("default_ttl_seconds", 300.0)),
+            volatile_keywords=cache_raw.get("volatile_keywords", CacheConfig().volatile_keywords),
+        )
+
+        providers: dict[str, ProviderConfig] = {}
+        for pid, pcfg in (raw_providers.get("providers") or {}).items():
+            providers[pid] = ProviderConfig(
+                id=pid,
+                name=pcfg.get("name", pid),
+                type=pcfg.get("type", pid),
+                enabled=bool(pcfg.get("enabled", False)),
+                base_url=pcfg.get("base_url"),
+                api_key_env=pcfg.get("api_key_env"),
+                timeout_seconds=float(pcfg.get("timeout_seconds", 30.0)),
+                max_concurrency=int(pcfg.get("max_concurrency", 4)),
+                priority=int(pcfg.get("priority", 0)),
+                extra=pcfg.get("extra", {}) or {},
+            )
+
+        if not server.admin_token:
+            # Never leave /admin/* unauthenticated by default (section 三十三).
+            server.admin_token = secrets.token_urlsafe(24)
+            logging.getLogger("xrouter.config").warning(
+                "No XROUTER_ADMIN_TOKEN configured — generated a random admin token for this run: %s "
+                "(set XROUTER_ADMIN_TOKEN in .env to persist it across restarts)",
+                server.admin_token,
+            )
+
+        return cls(
+            server=server, routing=routing, cache=cache, providers=providers,
+            raw_routing=raw_routing, model_overrides=model_overrides,
+        )
+
+
+_settings: Settings | None = None
+
+
+def get_settings(reload: bool = False) -> Settings:
+    global _settings
+    if _settings is None or reload:
+        _settings = Settings.load()
+    return _settings

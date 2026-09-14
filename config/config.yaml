@@ -1,0 +1,26 @@
+# XRouter server + cache settings. Secrets (API keys) never go here — see
+# providers.yaml's api_key_env fields and .env.example.
+
+server:
+  host: "0.0.0.0"
+  port: 20128
+  # admin_token: set via XROUTER_ADMIN_TOKEN in .env instead of here.
+  cors_origins: ["*"]
+  request_timeout_seconds: 60
+  max_request_body_bytes: 5000000
+  global_concurrency_limit: 64
+  per_client_rate_limit_per_minute: 120
+
+cache:
+  enabled: true
+  l1_max_entries: 512
+  default_ttl_seconds: 300
+  volatile_keywords:
+    - today
+    - now
+    - current
+    - latest
+    - news
+    - price
+    - stock
+    - weather

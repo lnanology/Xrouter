@@ -1,0 +1,13 @@
+# Optional per-model score overrides, applied on top of whatever a provider
+# adapter self-reports via list_models(). Keys are public model ids:
+# "<provider_id>/<model_name>". Leave empty to trust adapter defaults.
+#
+# Example:
+# models:
+#   ollama/llama3.1:
+#     quality_score: 0.7
+#     speed_score: 0.8
+#   groq/llama-3.1-8b-instant:
+#     cost_score: 0.9
+
+models: {}

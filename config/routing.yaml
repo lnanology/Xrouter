@@ -1,0 +1,4 @@
+routing:
+  default_policy: balanced   # fastest | cheapest | reliable | quota_aware | quality | balanced
+  max_fallback_attempts: 3
+  race_mode_enabled: false   # optional; off by default to avoid burning free-tier quota
