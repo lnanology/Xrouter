@@ -59,6 +59,14 @@ class RoutingConfig:
     # DAG may contain, so one request can't fan out into an unbounded
     # number of provider calls.
     max_dag_nodes: int = 20
+    # Planner (Phase 3 groundwork): the routing policy used for the one
+    # planning call itself (not the resulting DAG nodes, which each pick
+    # their own policy the normal way) -- "quality" by default, since a
+    # bad plan wastes every node run under it. How many times the planner
+    # re-prompts (feeding back the specific parse/validation error) before
+    # giving up on a request.
+    planner_routing_policy: str = "quality"
+    max_plan_retries: int = 2
     # Phase 2: when true, an unspecified client `routing_policy` is chosen
     # by the Task Classifier (task type + complexity) instead of always
     # falling back to `default_policy`. `default_policy` is still used when
@@ -119,6 +127,8 @@ class Settings:
             quality_gate_min_score=float(routing_raw.get("quality_gate_min_score", 0.5)),
             max_quality_retries=int(routing_raw.get("max_quality_retries", 1)),
             max_dag_nodes=int(routing_raw.get("max_dag_nodes", 20)),
+            planner_routing_policy=routing_raw.get("planner_routing_policy", "quality"),
+            max_plan_retries=int(routing_raw.get("max_plan_retries", 2)),
             task_aware_policy=bool(routing_raw.get("task_aware_policy", True)),
         )
 

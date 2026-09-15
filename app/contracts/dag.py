@@ -1,14 +1,17 @@
 """DAG (directed acyclic graph) execution contracts (Phase 2, spec 三十六).
 
-A DAG run is a client-supplied set of chat-completion nodes with explicit
-dependencies. XRouter does not invent a Planner that decides the graph for
-you — auto-generating a DAG from a single free-form request is Phase 3+
-multi-agent orchestration (Planner/Researcher/Critic/Verifier), which does
-not exist yet. What exists here is the execution substrate that phase
-will eventually sit on top of: hand XRouter an explicit graph, and it runs
-independent nodes concurrently, respects dependencies, and feeds each
-node's own upstream outputs into it via `{{node_id}}` placeholders in that
-node's message content."""
+A DAG run is a set of chat-completion nodes with explicit dependencies:
+hand XRouter a graph, and it runs independent nodes concurrently, respects
+dependencies, and feeds each node's own upstream outputs into it via
+`{{node_id}}` placeholders in that node's message content. This module
+defines the execution substrate only -- deciding *what* the graph should
+be is a separate concern: a client can supply one directly (POST
+/v1/dag/run, app/api/dag.py), or the Planner (Phase 3 groundwork,
+app/intelligence/planner.py) can generate one from a single free-form
+task and hand it to this exact same executor (POST /v1/plan/run,
+app/api/plan.py). Neither path duplicates the other's logic; the Planner
+only ever produces a DagRunRequest, it never talks to a provider except
+for its own one planning call."""
 from __future__ import annotations
 
 from typing import Any, Literal

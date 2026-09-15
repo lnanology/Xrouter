@@ -156,3 +156,19 @@ def test_dag_run_well_formed_but_no_providers_returns_200_with_failed_node(clien
     body = resp.json()
     assert body["status"] == "failed"
     assert body["nodes"][0]["status"] == "failed"
+
+
+def test_plan_run_no_providers_returns_503(client):
+    # Mirrors test_chat_completions_structured_error_when_no_providers:
+    # the planning call itself is a normal handle_chat() call, so with no
+    # provider able to even answer it, NoAvailableModelError propagates as
+    # a structured 503 -- there's no plan yet to report a partial result
+    # for. Unique task text avoids the cache-collision trap documented on
+    # the DAG no-providers test above.
+    _disable_all_providers(client)
+    resp = client.post(
+        "/v1/plan/run",
+        json={"task": "plan no-providers probe, do not cache-collide"},
+    )
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["type"] == "xrouter_error"

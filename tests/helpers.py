@@ -23,7 +23,8 @@ class FakeProvider(Provider):
     def __init__(
         self, config: ProviderConfig, models: list[ModelInfo], behavior="success",
         fail_after_chunks: int | None = None, delay_seconds: float = 0.0,
-        content: str = "ok", finish_reason: str = "stop",
+        content: str = "ok", finish_reason: str = "stop", tool_calls: list[dict] | None = None,
+        responses: list[dict] | None = None,
     ):
         super().__init__(config)
         self._models = models
@@ -32,6 +33,14 @@ class FakeProvider(Provider):
         self.delay_seconds = delay_seconds
         self.content = content
         self.finish_reason = finish_reason
+        self.tool_calls = tool_calls
+        # Optional script: one dict of {content?, finish_reason?, tool_calls?}
+        # per call, consumed in order (the last entry repeats once
+        # exhausted). Lets a single FakeProvider stand in for a real model
+        # across a whole planner retry loop -- e.g. an invalid submit_plan
+        # call first, then a valid one -- without needing multiple fake
+        # providers wired into the same test.
+        self.responses = responses
         self.call_count = 0
         self.cancelled = False
         self.last_request: ChatCompletionRequest | None = None
@@ -76,9 +85,18 @@ class FakeProvider(Provider):
                 self.cancelled = True
                 raise
         self._maybe_raise()
+        step: dict = {}
+        if self.responses:
+            step = self.responses[min(self.call_count - 1, len(self.responses) - 1)]
+        content = step.get("content", self.content)
+        finish_reason = step.get("finish_reason", self.finish_reason)
+        tool_calls = step.get("tool_calls", self.tool_calls)
+        message: dict = {"role": "assistant", "content": content}
+        if tool_calls:
+            message["tool_calls"] = tool_calls
         return ChatCompletionResponse(
             model=f"{self.id}/{model}",
-            choices=[ChatCompletionChoice(index=0, message={"role": "assistant", "content": self.content}, finish_reason=self.finish_reason)],
+            choices=[ChatCompletionChoice(index=0, message=message, finish_reason=finish_reason)],
             usage=Usage(prompt_tokens=5, completion_tokens=5, total_tokens=10),
         )
 
@@ -163,8 +181,8 @@ async def build_test_engine(tmp_path, provider_specs: dict[str, dict], **routing
 
 def make_model(provider_id: str, name: str = "test-model", **overrides) -> ModelInfo:
     defaults = dict(
-        id=name, provider_id=provider_id, name=name, capabilities=["chat", "streaming"],
-        supports_streaming=True, quality_score=0.7, speed_score=0.7, reliability_score=0.9, cost_score=0.8,
+        id=name, provider_id=provider_id, name=name, capabilities=["chat", "streaming", "tools"],
+        supports_streaming=True, supports_tools=True, quality_score=0.7, speed_score=0.7, reliability_score=0.9, cost_score=0.8,
     )
     defaults.update(overrides)
     return ModelInfo(**defaults)

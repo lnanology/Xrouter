@@ -8,6 +8,8 @@ routing:
   quality_gate_min_score: 0.5   # response.xrouter.quality.score below this fails the gate
   max_quality_retries: 1        # how many untried candidates to retry through on a failed gate
   max_dag_nodes: 20              # cap on nodes in a single POST /v1/dag/run request
+  planner_routing_policy: quality  # routing policy used for the Planner's own planning call
+  max_plan_retries: 2              # how many times the Planner re-prompts on an invalid/unrunnable plan
   # Phase 2: let the Task Classifier pick a policy per-request (task type +
   # complexity) instead of always using default_policy. A client-supplied
   # routing_policy in the request body always wins over both.
