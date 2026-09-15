@@ -137,7 +137,10 @@ def test_dag_run_cycle_returns_400(client):
 def test_dag_run_well_formed_but_no_providers_returns_200_with_failed_node(client):
     # A valid DAG still gets a 200 with per-node status — unlike the plain
     # /v1/chat/completions 503, a DAG run's "something failed" is reported
-    # inside the body since a run can be partially successful.
+    # inside the body since a run can be partially successful. Explicitly
+    # disable every provider rather than relying on the host having none
+    # reachable (a dev's real Mac may have Ollama installed and running).
+    _disable_all_providers(client)
     resp = client.post("/v1/dag/run", json={"nodes": [{"id": "a", "messages": [{"role": "user", "content": "hi"}]}]})
     assert resp.status_code == 200
     body = resp.json()
