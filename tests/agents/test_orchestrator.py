@@ -13,6 +13,7 @@ from app.contracts.orchestrator import OrchestrationRequest
 from app.contracts.planner import PlanNodeSpec, PlanSpec
 from app.core.errors import OrchestrationError
 from app.intelligence.critic import CRITIQUE_TOOL_NAME
+from app.intelligence.evidence import EVIDENCE_TOOL_NAME
 from app.intelligence.planner import PLAN_TOOL_NAME
 from app.intelligence.verifier import VERIFY_TOOL_NAME
 from tests.helpers import build_test_engine
@@ -42,6 +43,13 @@ def _verify_tool_call(satisfied: bool, feedback: str = "") -> dict:
     return {
         "id": "call_1", "type": "function",
         "function": {"name": VERIFY_TOOL_NAME, "arguments": json.dumps({"satisfied": satisfied, "feedback": feedback})},
+    }
+
+
+def _evidence_tool_call(claims: list[dict]) -> dict:
+    return {
+        "id": "call_1", "type": "function",
+        "function": {"name": EVIDENCE_TOOL_NAME, "arguments": json.dumps({"claims": claims})},
     }
 
 
@@ -297,6 +305,73 @@ async def test_orchestrate_tier4_includes_research_and_verifier_and_verifies(tmp
     assert result.verification.satisfied is True
     solo = engine.ctx.providers.get("solo")
     assert solo.call_count == 4
+
+
+# --- orchestrate(): trace_evidence (Phase 4: Evidence Graph) ----------------
+
+@pytest.mark.asyncio
+async def test_orchestrate_tier0_1_trace_evidence_is_a_noop(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"content": "hello there"}})
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER0, trace_evidence=True))
+    assert result.team == ["solver"]
+    assert result.evidence is None
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 1  # no evidence-tracing call at a tier with no DAG
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_tier2_with_trace_evidence_builds_and_attaches_evidence(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"content": "a solid answer"},
+        {"tool_calls": [_critique_tool_call(True)]},
+        {"tool_calls": [_evidence_tool_call([{"claim": "a solid answer", "supported_by": ["solve"], "supported": True}])]},
+    ]}})
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER2, trace_evidence=True))
+
+    assert result.team == ["solver", "critic", "evidence"]
+    assert result.evidence is not None
+    assert result.evidence.claims[0].supported_by == ["solve"]
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_tier3_trace_evidence_drops_a_hallucinated_node_id(tmp_path):
+    plan_json = [{"id": "solve", "prompt": "work the problem"}]
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"tool_calls": [_plan_tool_call(plan_json)]},
+        {"content": "the final answer"},
+        {"tool_calls": [_critique_tool_call(True)]},
+        {"tool_calls": [_evidence_tool_call([
+            {"claim": "the final answer", "supported_by": ["solve", "not_a_real_node"], "supported": True},
+        ])]},
+    ]}})
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER3, trace_evidence=True))
+
+    assert result.team == ["planner", "specialists", "critic", "evidence"]
+    assert result.evidence.claims[0].supported_by == ["solve"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_trace_evidence_fails_open_without_losing_the_answer(tmp_path):
+    def _fail_from_third_call(count: int) -> None:
+        if count >= 3:
+            from app.core.errors import ProviderServerError
+
+            raise ProviderServerError("simulated 500", provider_id="solo")
+
+    engine = await build_test_engine(tmp_path, {"solo": {
+        "behavior": _fail_from_third_call,
+        "responses": [{"content": "a solid answer"}, {"tool_calls": [_critique_tool_call(True)]}],
+    }})
+
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER2, trace_evidence=True))
+
+    # The evidence-tracing call itself failed, but that's advisory
+    # metadata -- it must never take down an already-produced answer.
+    assert result.answer == "a solid answer"
+    assert result.team == ["solver", "critic", "evidence"]
+    assert result.evidence.claims == []
 
 
 @pytest.mark.asyncio

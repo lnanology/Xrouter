@@ -6,6 +6,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 from app.contracts.dag import DagRunResponse
+from app.contracts.evidence import EvidenceGraph
 from app.contracts.verifier import VerificationResult
 
 
@@ -19,6 +20,11 @@ class OrchestrationRequest(BaseModel):
     # recall scoped to that conversation rather than leaking across
     # unrelated callers.
     scope: str = "global"
+    # Evidence Graph (Phase 4, app/intelligence/evidence.py): opt-in, same
+    # reasoning as verify/critique/race -- an extra LLM call shouldn't
+    # turn on silently. A silent no-op at tier 0-1, since there's no DAG
+    # there to trace any claim against.
+    trace_evidence: bool = False
 
 
 class OrchestrationResult(BaseModel):
@@ -32,4 +38,5 @@ class OrchestrationResult(BaseModel):
     answer: str  # the final, user-facing answer -- always a plain string, whatever team ran
     dag: DagRunResponse | None = None  # set only when the team ran more than a bare single call (tier >= 2)
     verification: VerificationResult | None = None  # set only at tier 4 (mandatory verification)
+    evidence: EvidenceGraph | None = None  # set only when trace_evidence was requested and a DAG actually ran
     latency_ms: float

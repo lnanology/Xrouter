@@ -1,4 +1,4 @@
-"""Confidence / Quality-Gate Engine (Phase 2, spec 三十六): a cheap, local,
+"""Quality Gate (Phase 2, spec 三十六): a cheap, local,
 deterministic pass over a completed response that catches the failure
 modes XRouter can actually observe without paying for another model call —
 an empty reply, output the provider itself truncated, or a small local

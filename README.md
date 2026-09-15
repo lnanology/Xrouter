@@ -10,28 +10,29 @@ This is **Phase 1** (fast, stable, low-cost, recoverable — no agents, no
 Kubernetes/Kafka/Redis, no quota/CAPTCHA/IP bypass of any kind), five
 pieces of **Phase 2**: a request-level task classifier, a telemetry-driven
 performance controller that auto-tunes routing weights, an opt-in race
-mode that dispatches the top candidates concurrently, a confidence/
-quality-gate engine that catches degenerate responses and retries them
-with a different candidate, and a DAG executor that runs a client-supplied
-graph of chat-completion nodes with wave-based concurrency and
-`{{node_id}}` output substitution — plus all of **Phase 3** (multi-agent
-orchestration): a Planner that turns a single free-form task into an
-explicit DAG (an actual LLM call, not a fixed template) and runs it
-through that same DAG executor, a Verifier that closes the plan → execute
-→ verify loop, a real, config-driven Web Search tool (Tavily-backed) that
-a DAG/Planner node can invoke through an XRouter-executed call → tool →
-call loop — not a fake placeholder that just echoes the query back — a
-Critic that reviews a single node's own output against its own
-instruction and reruns that node if unsatisfied, distinct from the
-Verifier's once-at-the-end whole-run check, a Dynamic Agent Team
-(`POST /v1/agents/run`) that assembles whichever of the above pieces a
-task's own complexity actually calls for (solver-only up through
-planner + specialists + critic + research + verifier + synthesizer), a
-standalone Researcher (`POST /v1/research`), and Memory/RAG — a real,
-keyword-based retrieve → augment-context → generate loop backed by a
-persistent, scope-isolated memory store, honestly scoped short of
-semantic search since XRouter has no embedding provider or vector store
-yet.
+mode that dispatches the top candidates concurrently, a quality gate
+that catches degenerate responses and retries them with a different
+candidate, and a DAG executor that runs a client-supplied graph of chat-
+completion nodes with wave-based concurrency and `{{node_id}}` output
+substitution — plus all of **Phase 3** (multi-agent orchestration): a
+Planner that turns a single free-form task into an explicit DAG (an
+actual LLM call, not a fixed template) and runs it through that same DAG
+executor, a Verifier that closes the plan → execute → verify loop, a
+real, config-driven Web Search tool (Tavily-backed) that a DAG/Planner
+node can invoke through an XRouter-executed call → tool → call loop —
+not a fake placeholder that just echoes the query back — a Critic that
+reviews a single node's own output against its own instruction and
+reruns that node if unsatisfied, distinct from the Verifier's once-at-
+the-end whole-run check, a Dynamic Agent Team (`POST /v1/agents/run`)
+that assembles whichever of the above pieces a task's own complexity
+actually calls for (solver-only up through planner + specialists +
+critic + research + verifier + synthesizer), a standalone Researcher
+(`POST /v1/research`), and Memory/RAG — a real, keyword-based retrieve →
+augment-context → generate loop backed by a persistent, scope-isolated
+memory store, honestly scoped short of semantic search since XRouter has
+no embedding provider or vector store yet. The first piece of **Phase 4**
+is in too: an Evidence Graph that traces a finished answer's own claims
+back to whichever DAG step actually produced each one.
 
 ## Quick start
 
@@ -530,6 +531,63 @@ same Protocol without touching a single caller. Tiers 0-1 never touch
 memory at all, for the same "don't tax the fast path" reason they skip
 every other piece of Phase 3.
 
+### Evidence Graph (Phase 4, opt-in: `"trace_evidence": true`)
+
+The first piece of Phase 4: once an Orchestrator run at tier ≥ 2
+finishes, `app/intelligence/evidence.py` asks — another actual LLM call
+(forced `submit_evidence_graph` tool call, not a heuristic) — which
+concrete claims the final answer makes, and for each one, which DAG step
+actually produced it:
+
+```bash
+curl http://localhost:20128/v1/agents/run \
+  -H "Content-Type: application/json" \
+  -d '{"task": "Look up the capital of France, then translate it to Spanish", "trace_evidence": true}'
+```
+
+```json
+{
+  "...": "the rest of the OrchestrationResult",
+  "evidence": {
+    "claims": [
+      {"claim": "Paris is the capital of France", "supported_by": ["capital"], "supported": true},
+      {"claim": "\"París\" is Spanish for Paris", "supported_by": ["translate"], "supported": true}
+    ]
+  }
+}
+```
+
+Despite the name, this ships as a flat claim → DAG-node-id mapping, not a
+literal multi-hop graph — nothing in XRouter today produces or consumes
+multi-hop evidence relationships, and building traversal machinery
+nobody uses would be exactly the "unnecessary infrastructure" the
+project's own rules forbid. It's also deliberately **DAG-node-level, not
+URL-level**: the Researcher's `web_search` results reach the model as
+prose its system prompt asks it to cite inline, but nothing in
+`app/execution/tool_loop.py` captures those citations as structured,
+addressable objects yet, so pretending to trace a claim to a specific URL
+today would be faking data XRouter doesn't actually have. DAG node
+outputs are the one thing this system genuinely has in structured form
+today, so that's what v1 traces against — a URL-level layer can extend
+this later without touching a single caller, the same "swappable, add
+without breaking callers" shape `app/retrieval/`'s `Retriever` Protocol
+already uses for the identical reason.
+
+`supported_by` is never trusted blindly — its JSON-schema `enum` is built
+fresh per call from the run's own real DAG node ids (plus
+`"model_knowledge"` for an untraceable claim), and any reference that
+slips past that enum anyway is dropped rather than propagated, the same
+defense-in-depth `app/intelligence/planner.py`'s `_validate_plan_shape`
+applies to a hallucinated `enable_tools` entry. Off by default (opt-in
+`trace_evidence`, same reasoning as `verify`/`critique`/race mode — an
+extra call shouldn't turn on silently) and fails open exactly like the
+Critic/Verifier: a missing/malformed tool call, or no provider able to
+answer at all, returns an empty evidence graph rather than losing the
+answer that's already been produced — this is advisory metadata about a
+response XRouter already committed to returning, never something that
+should hold it hostage. A silent no-op at tier 0-1, since there's no DAG
+there to trace any claim against.
+
 ## Tests
 
 ```bash
@@ -537,7 +595,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-271 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+286 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -655,6 +713,16 @@ reaching a real `MemoryRepository`, scoped correctly). `plan_mutator`
 plan before execution, left as a no-op when omitted, and reapplied on
 every re-plan, not just the first.
 
+Phase 4 coverage (`tests/execution/test_evidence.py`,
+`tests/agents/test_orchestrator.py`): the evidence tool schema's
+`supported_by` enum only ever listing the run's own real DAG node ids
+plus `"model_knowledge"`, a hallucinated node-id reference actually
+getting dropped rather than trusted (both as a pure `_sanitize_claims`
+unit test and end-to-end through the Orchestrator), fail-open on no
+provider / no tool call / malformed arguments, `trace_evidence` being a
+genuine no-op at tier 0-1, and the `"evidence"` tag only ever appearing
+in `team` when a graph was actually built.
+
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
 real macOS + Python 3.14 run of the full suite (the "no providers
@@ -662,7 +730,7 @@ reachable" tests now explicitly disable every provider rather than relying
 on the host having none installed, and the cache fixture uses
 `asyncio.run()` instead of the now-removed implicit-event-loop fallback).
 
-## What's implemented (Phase 1 + Phase 2 + Phase 3)
+## What's implemented (Phase 1 + Phase 2 + Phase 3 + partial Phase 4)
 
 **Phase 1:** FastAPI gateway · OpenAI-compatible `/v1/models` +
 `/v1/chat/completions` (incl. `stream=true`) · Provider adapter interface +
@@ -697,7 +765,7 @@ for non-streaming chat completions, returning whichever answers first and
 cancelling the rest; reuses the exact same breaker/quota/retry/performance
 bookkeeping as the sequential fallback chain via a shared
 `try_candidate()` helper, and falls back to the remaining candidates
-sequentially if every raced one fails. Confidence/Quality-Gate Engine
+sequentially if every raced one fails. Quality Gate
 (`app/intelligence/quality_gate.py`) — opt-in (`routing.quality_gate_enabled`)
 deterministic scoring of a non-streaming response (empty, truncated,
 degenerate word/character repetition, missing forced tool call) that
@@ -791,12 +859,26 @@ and written after every Orchestrator run at tier ≥ 2 — see the Memory/RAG
 section above for why keyword retrieval, not a faked-up "semantic"
 search, is what ships first.
 
+**Phase 4 (so far):** Evidence Graph (`app/intelligence/evidence.py`,
+`app/contracts/evidence.py`) — opt-in (`OrchestrationRequest.trace_evidence`)
+tracing of a finished Orchestrator answer's own claims back to whichever
+DAG step actually produced each one, also a forced tool call
+(`submit_evidence_graph`) rather than a heuristic; ships as a flat claim →
+DAG-node-id mapping (not a literal multi-hop graph) and deliberately
+DAG-node-level rather than URL-level, since XRouter doesn't yet capture
+`web_search` citations as structured, addressable objects — see the
+Evidence Graph section above for the full reasoning. Fails open exactly
+like the Critic/Verifier, and a no-op at tier 0-1 where there's no DAG to
+trace against.
+
 ## What's not implemented yet (by design — see Phase 4-5 in the spec)
 
-The real Phase 4 (Evidence Graph, Debate, Counterfactual, Simulation,
-Confidence Engine) and Phase 5 (Evolution Engine, A/B Routing, Policy
-Learning, Self-healing, Automated Benchmark) haven't started. Also still
-open: other tool types beyond `web_search`, multi-turn agent loops,
+The rest of Phase 4 (Debate, Counterfactual, Simulation, Confidence
+Engine — Evidence Graph is done, see above) and all of Phase 5 (Evolution
+Engine, A/B Routing, Policy Learning, Self-healing, Automated Benchmark)
+haven't started; being built one piece at a time, in that order, each
+with its own review checkpoint. Also still open: other tool types beyond
+`web_search`, multi-turn agent loops,
 tool-using agents that act on a plan's own intermediate results mid-run
 rather than a single forced-JSON planning call up front, a real
 embeddings-backed `Retriever` (Memory/RAG is keyword-based today, by

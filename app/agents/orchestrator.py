@@ -25,9 +25,14 @@ from spec section 七:
       forcing a tool call the task doesn't actually need would be exactly
       the "fake placeholder functionality" XRouter's rules forbid.
 
-Debate (spec Phase 4: Evidence Graph/Debate/Counterfactual/Simulation/
-Confidence Engine) is deliberately NOT part of tier 4 here -- it belongs
-to the next phase, and a stub would be fake by definition. "Coder" (named
+Evidence Graph (Phase 4's first piece, app/intelligence/evidence.py) is
+opt-in via OrchestrationRequest.trace_evidence: when a DAG actually ran
+(tier >= 2) it traces the final answer's own claims back to whichever
+step produced each one, or flags a claim as untraceable ("model
+knowledge, not checked"). The other four Phase 4 pieces (Debate/
+Counterfactual/Simulation/Confidence Engine) are deliberately NOT part of
+tier 4 here -- they belong to later steps, and a stub would be fake by
+definition. "Coder" (named
 once in the spec's agents/ listing, never detailed elsewhere) also isn't
 a separate stage: task_type=CODE already gets a quality-biased routing
 policy from the Task Classifier, which is the existing, real behavior
@@ -47,6 +52,7 @@ from typing import TYPE_CHECKING
 
 from app.agents.synthesizer import synthesize
 from app.contracts.dag import DagNodeRequest, DagRunRequest, DagRunResponse
+from app.contracts.evidence import EvidenceGraph
 from app.contracts.orchestrator import OrchestrationRequest, OrchestrationResult
 from app.contracts.planner import PlanRequest, PlanSpec
 from app.contracts.request import ChatCompletionRequest, ChatMessage
@@ -54,6 +60,7 @@ from app.contracts.response import ChatCompletionResponse, extract_message_text
 from app.core.errors import NoAvailableModelError, OrchestrationError
 from app.execution.dag import DagExecutor
 from app.execution.plan_runner import run_plan_with_verification
+from app.intelligence.evidence import build_evidence_graph
 from app.intelligence.task_classifier import classify
 from app.observability.logging import get_logger
 from app.retrieval.keyword import KeywordRetriever
@@ -130,6 +137,21 @@ async def _run_single_node_with_critique(engine: "ChatEngine", request: Orchestr
     ).run(DagRunRequest(nodes=[node]))
 
 
+async def _maybe_trace_evidence(
+    engine: "ChatEngine", request: OrchestrationRequest, answer: str, dag: DagRunResponse, team: list[str],
+) -> EvidenceGraph | None:
+    """Builds an Evidence Graph for the finished answer when
+    trace_evidence was requested, and records "evidence" in `team` when it
+    actually ran -- mutates `team` in place, mirroring how the "research"/
+    "synthesizer"/"verifier" tags are only ever added once something
+    actually happened, never because a tier "should" have used it."""
+    if not request.trace_evidence:
+        return None
+    evidence = await build_evidence_graph(engine, request.task, answer, dag, routing_policy=request.routing_policy)
+    team.append("evidence")
+    return evidence
+
+
 async def _synthesize_or_fallback(engine: "ChatEngine", request: OrchestrationRequest, dag: DagRunResponse) -> tuple[str, bool]:
     """Returns (answer, used_synthesizer). Raises OrchestrationError if
     every node in the DAG failed -- there is nothing honest to synthesize
@@ -169,10 +191,12 @@ async def orchestrate(engine: "ChatEngine", request: OrchestrationRequest) -> Or
         if node.status != "success" or node.response is None:
             raise OrchestrationError(node.error or "the step failed; nothing to answer with")
         answer = extract_message_text(node.response).strip()
+        team = ["solver", "critic"]
+        evidence = await _maybe_trace_evidence(engine, request, answer, dag_result, team)
         await _remember(engine, request, answer)
         return OrchestrationResult(
-            id=new_id("orch"), team=["solver", "critic"], complexity=complexity, task_type=task_type,
-            answer=answer, dag=dag_result, latency_ms=round((time.time() - start) * 1000, 1),
+            id=new_id("orch"), team=team, complexity=complexity, task_type=task_type,
+            answer=answer, dag=dag_result, evidence=evidence, latency_ms=round((time.time() - start) * 1000, 1),
         )
 
     verify_tier = complexity >= 4
@@ -197,10 +221,11 @@ async def orchestrate(engine: "ChatEngine", request: OrchestrationRequest) -> Or
     if used_synthesizer:
         team.append("synthesizer")
 
+    evidence = await _maybe_trace_evidence(engine, request, answer, plan_result.dag, team)
     await _remember(engine, request, answer)
 
     return OrchestrationResult(
         id=new_id("orch"), team=team, complexity=complexity, task_type=task_type,
-        answer=answer, dag=plan_result.dag, verification=plan_result.verification,
+        answer=answer, dag=plan_result.dag, verification=plan_result.verification, evidence=evidence,
         latency_ms=round((time.time() - start) * 1000, 1),
     )
