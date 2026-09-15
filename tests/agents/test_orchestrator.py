@@ -284,7 +284,7 @@ async def test_orchestrate_tier3_all_nodes_failed_raises_orchestration_error(tmp
 # --- orchestrate(): tier 4 (very hard -- + research hint + verifier) -------
 
 @pytest.mark.asyncio
-async def test_orchestrate_tier4_includes_research_and_verifier_and_verifies(tmp_path):
+async def test_orchestrate_tier4_includes_research_verifier_and_debate(tmp_path):
     plan_json = [{"id": "solve", "prompt": "research and answer", "enable_tools": ["web_search"]}]
     engine = await build_test_engine(
         tmp_path,
@@ -293,18 +293,54 @@ async def test_orchestrate_tier4_includes_research_and_verifier_and_verifies(tmp
             {"content": "researched answer"},                    # 2: node (offered web_search, doesn't call it)
             {"tool_calls": [_critique_tool_call(True)]},          # 3: forced critique on the terminal node
             {"tool_calls": [_verify_tool_call(True)]},            # 4: verifier, satisfied
+            {"content": "the case for this answer"},              # 5: debate advocate
+            {"content": "a counterpoint to consider"},             # 6: debate skeptic
+            {"content": "the final, strengthened answer"},          # 7: debate judge
         ]}},
         tool_specs={"web_search": {}},
     )
     result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER4))
 
     assert result.complexity == 4
-    assert result.team == ["planner", "specialists", "critic", "research", "verifier"]
-    assert result.answer == "researched answer"
+    assert result.team == ["planner", "specialists", "critic", "research", "verifier", "debate"]
+    # Debate's judge output must actually replace the pre-debate draft.
+    assert result.answer == "the final, strengthened answer"
     assert result.verification is not None
     assert result.verification.satisfied is True
+    assert result.debate is not None
+    assert result.debate.position == "researched answer"
+    assert result.debate.resolution == "the final, strengthened answer"
     solo = engine.ctx.providers.get("solo")
-    assert solo.call_count == 4
+    assert solo.call_count == 7
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_tier4_debate_fails_open_without_losing_the_pre_debate_answer(tmp_path):
+    plan_json = [{"id": "solve", "prompt": "answer"}]
+
+    def _fail_from_sixth_call(count: int) -> None:
+        if count >= 6:
+            from app.core.errors import ProviderServerError
+
+            raise ProviderServerError("simulated 500", provider_id="solo")
+
+    engine = await build_test_engine(tmp_path, {"solo": {
+        "behavior": _fail_from_sixth_call,
+        "responses": [
+            {"tool_calls": [_plan_tool_call(plan_json)]},       # 1: plan
+            {"content": "researched answer"},                    # 2: node
+            {"tool_calls": [_critique_tool_call(True)]},          # 3: forced critique
+            {"tool_calls": [_verify_tool_call(True)]},            # 4: verifier, satisfied
+            {"content": "the case for this answer"},              # 5: debate advocate (succeeds)
+            # call 6 (debate skeptic) fails -- the whole debate must roll back
+        ],
+    }})
+
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER4))
+
+    assert result.answer == "researched answer"
+    assert result.team == ["planner", "specialists", "critic", "verifier"]
+    assert result.debate is None
 
 
 # --- orchestrate(): trace_evidence (Phase 4: Evidence Graph) ----------------

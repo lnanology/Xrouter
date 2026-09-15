@@ -30,9 +30,12 @@ critic + research + verifier + synthesizer), a standalone Researcher
 (`POST /v1/research`), and Memory/RAG — a real, keyword-based retrieve →
 augment-context → generate loop backed by a persistent, scope-isolated
 memory store, honestly scoped short of semantic search since XRouter has
-no embedding provider or vector store yet. The first piece of **Phase 4**
-is in too: an Evidence Graph that traces a finished answer's own claims
-back to whichever DAG step actually produced each one.
+no embedding provider or vector store yet. Two pieces of **Phase 4** are
+in too: an Evidence Graph that traces a finished answer's own claims back
+to whichever DAG step actually produced each one, and a Debate stage —
+automatic at tier 4 — where an Advocate and a Skeptic argue for and
+against the draft answer and a Judge reconciles both into a final,
+strengthened one.
 
 ## Quick start
 
@@ -588,6 +591,60 @@ response XRouter already committed to returning, never something that
 should hold it hostage. A silent no-op at tier 0-1, since there's no DAG
 there to trace any claim against.
 
+### Debate (Phase 4, tier 4 only — no opt-in flag)
+
+The second piece of Phase 4, and the only one so far that isn't opt-in:
+spec section 十九's own "Very hard" team table lists `Planner + parallel
+specialists + Research + Debate + Verification + Synthesizer` as the
+tier-4 team, the same standing membership the Verifier already has there
+— so Debate just runs, automatically, whenever complexity reaches tier 4.
+
+Once tier 4's draft answer exists (the same draft `_synthesize_or_fallback`
+already produces), three real calls stress-test it: an Advocate argues
+it's correct and well-supported, a Skeptic argues the opposite — real
+gaps or overstatements, not reflexive contrarianism — and a Judge is
+shown both arguments plus the draft and writes ONE final, strengthened
+answer. That Judge output *replaces* the draft as `OrchestrationResult.answer`
+— Debate revises the answer, it doesn't just annotate it on the side:
+
+```bash
+curl http://localhost:20128/v1/agents/run \
+  -H "Content-Type: application/json" \
+  -d '{"task": "Should we use microservices or a monolith for a 3-person startup building an MVP?"}'
+```
+
+```json
+{
+  "...": "the rest of the OrchestrationResult",
+  "team": ["planner", "specialists", "critic", "verifier", "debate"],
+  "answer": "... the judge's strengthened final answer ...",
+  "debate": {
+    "position": "... the pre-debate draft ...",
+    "advocate": "... the case for the draft ...",
+    "skeptic": "... the case against it ...",
+    "resolution": "... same text as the top-level answer ..."
+  }
+}
+```
+
+Deliberately **not** wired in literally between DAG execution and
+Verification the way spec section 十九's left-to-right list might
+suggest — `app/execution/plan_runner.py`'s `run_plan_with_verification()`
+is reused wholesale, the same reuse discipline the rest of Phase 3/4
+already follows, so Debate instead runs on the DAG that already passed
+verification (or was re-planned until it did). Debating a draft
+verification was about to throw away would waste three calls on a losing
+position; debating the winning one is what actually matters.
+
+Fails open with a sharper edge than Evidence Graph, since there's no
+"just return nothing" option for something that's supposed to revise the
+answer: any `NoAvailableModelError` from the three calls, or an empty
+Judge output, rolls the whole debate back and keeps the untouched
+pre-debate draft — the same "an already-produced answer must never be
+lost to a best-effort enrichment" discipline `_synthesize_or_fallback`
+itself already applies to a failed `synthesize()` call. `"debate"` is
+only added to `team` when it actually completed. Never runs at tier ≤ 3.
+
 ## Tests
 
 ```bash
@@ -595,7 +652,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-286 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+296 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -713,15 +770,27 @@ reaching a real `MemoryRepository`, scoped correctly). `plan_mutator`
 plan before execution, left as a no-op when omitted, and reapplied on
 every re-plan, not just the first.
 
-Phase 4 coverage (`tests/execution/test_evidence.py`,
-`tests/agents/test_orchestrator.py`): the evidence tool schema's
+Phase 4 coverage: Evidence Graph (`tests/execution/test_evidence.py`,
+`tests/agents/test_orchestrator.py`) — the evidence tool schema's
 `supported_by` enum only ever listing the run's own real DAG node ids
 plus `"model_knowledge"`, a hallucinated node-id reference actually
 getting dropped rather than trusted (both as a pure `_sanitize_claims`
 unit test and end-to-end through the Orchestrator), fail-open on no
 provider / no tool call / malformed arguments, `trace_evidence` being a
 genuine no-op at tier 0-1, and the `"evidence"` tag only ever appearing
-in `team` when a graph was actually built.
+in `team` when a graph was actually built. Debate
+(`tests/agents/test_debate.py`, `tests/agents/test_orchestrator.py`) —
+the happy path actually returning the judge's resolution (not the
+pre-debate draft) with all four `DebateResult` fields populated
+correctly, three distinct fail-open cases (no provider at all, a later
+call failing after an earlier one already succeeded, and the judge
+returning nothing usable) all rolling back to the untouched draft rather
+than a half-finished revision, the judge's own prompt actually
+truncating an oversized advocate/skeptic argument instead of embedding it
+whole, and — end-to-end through the Orchestrator — tier 4 both running
+debate and replacing `answer` with its resolution, `"debate"` only
+appearing in `team` when it actually completed, and tier 3 never
+triggering it at all.
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -869,15 +938,28 @@ DAG-node-level rather than URL-level, since XRouter doesn't yet capture
 `web_search` citations as structured, addressable objects — see the
 Evidence Graph section above for the full reasoning. Fails open exactly
 like the Critic/Verifier, and a no-op at tier 0-1 where there's no DAG to
-trace against.
+trace against. Debate (`app/agents/debate.py`, `app/contracts/debate.py`)
+— a standing tier-4 team member per spec section 十九's own team table
+(no opt-in flag, unlike Evidence Graph): an Advocate and a Skeptic argue
+for and against the tier's draft answer and a Judge reconciles both into
+a final, strengthened answer that replaces the draft as
+`OrchestrationResult.answer`. Deliberately runs after
+`run_plan_with_verification()` returns rather than literally between DAG
+execution and Verification, so it debates only a plan that already
+passed verification instead of burning calls on one about to be thrown
+away — see the Debate section above. Fails open with a sharper edge than
+Evidence Graph (any failed call, or an empty judge output, rolls back to
+the untouched pre-debate draft, since there's no harmless "return
+nothing" option for a step that's supposed to revise the answer).
 
 ## What's not implemented yet (by design — see Phase 4-5 in the spec)
 
-The rest of Phase 4 (Debate, Counterfactual, Simulation, Confidence
-Engine — Evidence Graph is done, see above) and all of Phase 5 (Evolution
-Engine, A/B Routing, Policy Learning, Self-healing, Automated Benchmark)
-haven't started; being built one piece at a time, in that order, each
-with its own review checkpoint. Also still open: other tool types beyond
+The rest of Phase 4 (Counterfactual, Simulation, Confidence
+Engine — Evidence Graph and Debate are done, see above) and all of Phase
+5 (Evolution Engine, A/B Routing, Policy Learning, Self-healing,
+Automated Benchmark) haven't started; being built one piece at a time, in
+that order, each with its own review checkpoint. Also still open: other
+tool types beyond
 `web_search`, multi-turn agent loops,
 tool-using agents that act on a plan's own intermediate results mid-run
 rather than a single forced-JSON planning call up front, a real

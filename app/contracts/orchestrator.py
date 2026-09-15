@@ -6,6 +6,7 @@ from __future__ import annotations
 from pydantic import BaseModel
 
 from app.contracts.dag import DagRunResponse
+from app.contracts.debate import DebateResult
 from app.contracts.evidence import EvidenceGraph
 from app.contracts.verifier import VerificationResult
 
@@ -38,5 +39,6 @@ class OrchestrationResult(BaseModel):
     answer: str  # the final, user-facing answer -- always a plain string, whatever team ran
     dag: DagRunResponse | None = None  # set only when the team ran more than a bare single call (tier >= 2)
     verification: VerificationResult | None = None  # set only at tier 4 (mandatory verification)
+    debate: DebateResult | None = None  # set only at tier 4, and only when the debate actually completed (fails open otherwise)
     evidence: EvidenceGraph | None = None  # set only when trace_evidence was requested and a DAG actually ran
     latency_ms: float

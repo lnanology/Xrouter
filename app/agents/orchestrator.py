@@ -29,9 +29,15 @@ Evidence Graph (Phase 4's first piece, app/intelligence/evidence.py) is
 opt-in via OrchestrationRequest.trace_evidence: when a DAG actually ran
 (tier >= 2) it traces the final answer's own claims back to whichever
 step produced each one, or flags a claim as untraceable ("model
-knowledge, not checked"). The other four Phase 4 pieces (Debate/
-Counterfactual/Simulation/Confidence Engine) are deliberately NOT part of
-tier 4 here -- they belong to later steps, and a stub would be fake by
+knowledge, not checked"). Debate (Phase 4's second piece,
+app/agents/debate.py) is, unlike Evidence Graph, a standing member of the
+tier-4 team per spec section 十九's own "Very hard" table -- no opt-in
+flag, it just runs: an Advocate and a Skeptic argue for and against the
+tier's draft answer, and a Judge reconciles both into a final,
+strengthened answer that replaces the draft, failing open to the
+untouched draft on any problem. The remaining two Phase 4 pieces
+(Counterfactual/Simulation/Confidence Engine) are deliberately NOT part
+of tier 4 here -- they belong to later steps, and a stub would be fake by
 definition. "Coder" (named
 once in the spec's agents/ listing, never detailed elsewhere) also isn't
 a separate stage: task_type=CODE already gets a quality-biased routing
@@ -50,8 +56,10 @@ from __future__ import annotations
 import time
 from typing import TYPE_CHECKING
 
+from app.agents.debate import debate
 from app.agents.synthesizer import synthesize
 from app.contracts.dag import DagNodeRequest, DagRunRequest, DagRunResponse
+from app.contracts.debate import DebateResult
 from app.contracts.evidence import EvidenceGraph
 from app.contracts.orchestrator import OrchestrationRequest, OrchestrationResult
 from app.contracts.planner import PlanRequest, PlanSpec
@@ -221,11 +229,19 @@ async def orchestrate(engine: "ChatEngine", request: OrchestrationRequest) -> Or
     if used_synthesizer:
         team.append("synthesizer")
 
+    debate_result: DebateResult | None = None
+    if verify_tier:  # Debate is a standing tier-4 team member, spec section 十九
+        answer, debate_result = await debate(
+            engine, request.task, request.context, plan_result.dag, answer, routing_policy=request.routing_policy,
+        )
+        if debate_result is not None:
+            team.append("debate")
+
     evidence = await _maybe_trace_evidence(engine, request, answer, plan_result.dag, team)
     await _remember(engine, request, answer)
 
     return OrchestrationResult(
         id=new_id("orch"), team=team, complexity=complexity, task_type=task_type,
-        answer=answer, dag=plan_result.dag, verification=plan_result.verification, evidence=evidence,
+        answer=answer, dag=plan_result.dag, verification=plan_result.verification, debate=debate_result, evidence=evidence,
         latency_ms=round((time.time() - start) * 1000, 1),
     )
