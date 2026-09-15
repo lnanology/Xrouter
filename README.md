@@ -14,14 +14,17 @@ mode that dispatches the top candidates concurrently, a confidence/
 quality-gate engine that catches degenerate responses and retries them
 with a different candidate, and a DAG executor that runs a client-supplied
 graph of chat-completion nodes with wave-based concurrency and
-`{{node_id}}` output substitution — plus the first three pieces of
-**Phase 3** (multi-agent orchestration groundwork): a Planner that turns a
-single free-form task into an explicit DAG (an actual LLM call, not a
-fixed template) and runs it through that same DAG executor, a Verifier
-that closes the plan → execute → verify loop, and a real, config-driven
-Web Search tool (Tavily-backed) that a DAG/Planner node can invoke through
-an XRouter-executed call → tool → call loop — not a fake placeholder that
-just echoes the query back.
+`{{node_id}}` output substitution — plus four pieces of **Phase 3**
+(multi-agent orchestration groundwork): a Planner that turns a single
+free-form task into an explicit DAG (an actual LLM call, not a fixed
+template) and runs it through that same DAG executor, a Verifier that
+closes the plan → execute → verify loop, a real, config-driven Web Search
+tool (Tavily-backed) that a DAG/Planner node can invoke through an
+XRouter-executed call → tool → call loop — not a fake placeholder that
+just echoes the query back — and a Critic that reviews a single node's
+own output against its own instruction and reruns that node if
+unsatisfied, distinct from the Verifier's once-at-the-end, whole-run
+check.
 
 ## Quick start
 
@@ -73,8 +76,8 @@ provider:
   `quality_gate_enabled` / `quality_gate_min_score` / `max_quality_retries`
   (see Quality gate below), `max_dag_nodes` (see DAG Executor below),
   `planner_routing_policy` / `max_plan_retries` / `max_verify_retries`
-  (see Planner / Verifier below), and `max_tool_iterations` (see Tools
-  below).
+  (see Planner / Verifier below), `max_tool_iterations` (see Tools below),
+  and `max_critique_retries` (see Critic below).
 - `config/models.yaml` — optional score overrides per model, applied on top
   of whatever each adapter self-reports.
 - `config/tools.yaml` — which XRouter-executed tools exist (currently
@@ -261,6 +264,53 @@ class implementing `app/tools/base.py`'s `ExecutableTool` Protocol
 registering a builder in `app/tools/factory.py` — no other code needs to
 change, same pattern as adding a provider adapter.
 
+### Critic (opt-in per node: `"critique": true`)
+
+Per-node review — distinct from the Verifier below, which only ever
+judges the *whole* run against the *original* task, once, after
+everything has finished. A bad step three nodes deep can already have
+poisoned everything downstream (via `{{node_id}}` substitution) long
+before the Verifier ever gets a look, or if `verify` was never set at
+all. Set `"critique": true` on a node and, right after it produces a
+response, XRouter asks the Critic — another actual LLM call (forced
+`submit_critique` tool call), not a heuristic — whether that node's own
+output actually satisfies that node's own instruction. If not, the node
+re-runs with the Critic's feedback appended, up to
+`routing.max_critique_retries` times (default `1`), before accepting
+whatever the last attempt produced:
+
+```bash
+curl http://localhost:20128/v1/dag/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "nodes": [
+      {"id": "summary", "critique": true,
+       "messages": [{"role": "user", "content": "Summarize this in exactly 3 bullet points: ..."}]}
+    ]
+  }'
+```
+
+The result's `nodes[].critique` reports the Critic's final judgment
+(`{"satisfied": true, "feedback": null}` or similar) whenever a node had
+`critique: true` — `null` for every node that didn't opt in. Off by
+default, same reasoning as race mode/the quality gate/the Verifier: a
+failed critique costs an extra call *and* re-runs that node, so it
+shouldn't turn on silently. The Critic **fails open** exactly like the
+Verifier — a missing/malformed tool call, or no provider able to answer
+the critique call at all, counts as "satisfied" rather than blocking or
+endlessly retrying a node that already produced *something*; and even
+after every retry is exhausted with the Critic still unsatisfied, the
+node's own status stays `"success"` — critique is a best-effort review,
+never a pass/fail gate on whether the node ran. The retry loop itself
+(`app/execution/critique_loop.py`) re-runs through the node's own
+`responder` — a plain call, or `app/execution/tool_loop.py`'s tool loop
+when the node also has `enable_tools` — so it never duplicates
+provider-calling logic of its own.
+
+The Planner can also set `critique: true` on a node it generates itself,
+for a step it judges "genuinely matters and is easy to get subtly wrong
+in one shot" (e.g. a final synthesis step) — see Planner below.
+
 ### Planner
 
 The first piece of Phase 3 (multi-agent orchestration groundwork):
@@ -305,21 +355,22 @@ as a plain `/v1/chat/completions` outage); `422` if every retry still
 produced an unusable plan; `200` with the full `plan` + `dag` result
 otherwise, `plan_attempts` telling you whether it took more than one try.
 
-Each planned node can also carry two optional, richer fields the model
+Each planned node can also carry three optional, richer fields the model
 fills in itself when it judges a step needs them: `routing_policy`
 overrides the routing policy for just that one step (e.g. `"quality"` for
-a final synthesis step, while the rest stay on the default), and
-`enable_tools` lets a step use a real tool (see Tools above) if it
-genuinely needs current or external information it can't answer from its
-own knowledge. The `submit_plan` schema's `enable_tools` is never a fixed
-list — it's built fresh per call from `ToolRegistry.available_names()`,
-so a plan can never even syntactically request a tool that isn't actually
-registered and configured right now; `_validate_plan_shape()` also
-double-checks this itself after the call returns, since not every
-provider strictly enforces a JSON-schema `enum` on generated tool-call
-arguments, and a plan requesting an unknown tool is rejected (and
-re-prompted, same as any other invalid plan) rather than silently running
-that step with no tool at all.
+a final synthesis step, while the rest stay on the default), `enable_tools`
+lets a step use a real tool (see Tools above) if it genuinely needs
+current or external information it can't answer from its own knowledge,
+and `critique` (see Critic above) flags a step whose correctness genuinely
+matters for independent per-node review. The `submit_plan` schema's
+`enable_tools` is never a fixed list — it's built fresh per call from
+`ToolRegistry.available_names()`, so a plan can never even syntactically
+request a tool that isn't actually registered and configured right now;
+`_validate_plan_shape()` also double-checks this itself after the call
+returns, since not every provider strictly enforces a JSON-schema `enum`
+on generated tool-call arguments, and a plan requesting an unknown tool is
+rejected (and re-prompted, same as any other invalid plan) rather than
+silently running that step with no tool at all.
 
 #### Verifier (opt-in: `"verify": true`)
 
@@ -367,7 +418,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-207 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+224 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/integration` —
 circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -442,7 +493,23 @@ fields carried through `to_dag_request()`, `_validate_plan_shape()`
 rejecting a hallucinated/unavailable tool name, and — end-to-end through
 `build_test_engine` — a plan actually offering only the registered
 tool(s) in its schema and a plan that hallucinates an unavailable tool
-being rejected and successfully retried).
+being rejected and successfully retried), and the Critic
+(`tests/execution/test_critic.py` — forced-tool-call request building,
+satisfied/unsatisfied reporting, and the same fail-open behavior as the
+Verifier on a missing tool call / malformed arguments / no provider
+available, plus the retry loop itself: satisfied-first-try never
+re-running the node, an unsatisfied-then-satisfied cycle actually
+re-running through the node's own responder with the Critic's feedback
+provably reaching the re-run request, giving up after exhausting
+`max_retries` while still returning the last attempt, and
+`max_retries=0` never re-running at all — and, end-to-end through
+`DagExecutor` in `tests/execution/test_dag.py`, a node without
+`critique` never triggering a review call, a node with `critique: true`
+satisfied on the first try, an unsatisfied-then-satisfied node actually
+rerunning itself and the corrected output reaching the final result, and
+a node that stays unsatisfied through every retry still reporting overall
+`"success"` since critique is a best-effort review, never a pass/fail
+gate on the node itself).
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -542,16 +609,29 @@ configured is left untouched for the client to handle. The Planner's
 and a dynamically-built `enable_tools` enum that only ever lists tools the
 registry actually has available, with a defense-in-depth runtime check
 rejecting any hallucinated tool name that slipped past the JSON-schema
-`enum`.
+`enum`. Critic (`app/intelligence/critic.py`, `app/contracts/critic.py`,
+`app/execution/critique_loop.py`) — opt-in per node
+(`DagNodeRequest.critique` / `PlanNodeSpec.critique`) review, also a
+forced tool call (`submit_critique`) rather than a heuristic, distinct
+from the Verifier: it judges one node's own output against that node's
+own instruction right after the node produces it, rather than the whole
+run against the original task once everything has finished, so a weak
+step can be caught and redone before it poisons anything downstream that
+substitutes `{{node_id}}` from it. An unsatisfied critique re-runs the
+node (through the node's own responder — a plain call, or the tool loop
+when `enable_tools` is also set) with the feedback folded in, up to
+`routing.max_critique_retries` times; fails open exactly like the
+Verifier, and even after exhausting every retry the node's own status
+stays `"success"` — critique is a best-effort review, never a pass/fail
+gate on whether the node ran.
 
 ## What's not implemented yet (by design — see Phase 3-5 in the spec)
 
 The rest of multi-agent orchestration beyond Planner + Verifier + Web
-Search — a dedicated Critic role (per-node review, distinct from the
-Verifier's end-of-run check), other tool types beyond `web_search`,
-multi-turn agent loops, tool-using agents that act on a plan's own
-intermediate results mid-run rather than a single forced-JSON planning
-call up front — RAG/memory, plugin loader, browser/web-AI adapter,
+Search + Critic — other tool types beyond `web_search`, multi-turn agent
+loops, tool-using agents that act on a plan's own intermediate results
+mid-run rather than a single forced-JSON planning call up front — RAG/
+memory, plugin loader, browser/web-AI adapter,
 network failover/VPN layer, PostgreSQL migration, LLM-graded (as opposed
 to structural) quality assessment, and streaming versions of race mode
 and the quality gate (both above only cover non-streaming requests — a

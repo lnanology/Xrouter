@@ -76,6 +76,11 @@ class RoutingConfig:
     # (DagNodeRequest.enable_tools) before giving up and returning
     # whatever the model last said, rather than looping forever.
     max_tool_iterations: int = 3
+    # Critic (Phase 3): how many times a single DAG node re-runs itself
+    # with the Critic's feedback folded in (DagNodeRequest.critique)
+    # before accepting whatever the last attempt produced, rather than
+    # retrying forever.
+    max_critique_retries: int = 1
     # Phase 2: when true, an unspecified client `routing_policy` is chosen
     # by the Task Classifier (task type + complexity) instead of always
     # falling back to `default_policy`. `default_policy` is still used when
@@ -152,6 +157,7 @@ class Settings:
             max_plan_retries=int(routing_raw.get("max_plan_retries", 2)),
             max_verify_retries=int(routing_raw.get("max_verify_retries", 1)),
             max_tool_iterations=int(routing_raw.get("max_tool_iterations", 3)),
+            max_critique_retries=int(routing_raw.get("max_critique_retries", 1)),
             task_aware_policy=bool(routing_raw.get("task_aware_policy", True)),
         )
 

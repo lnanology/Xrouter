@@ -6,10 +6,10 @@ from app.tools.registry import ToolRegistry
 from tests.helpers import FakeTool, build_test_engine
 
 
-def _node(id_, depends_on=None, content="hi", model="auto", enable_tools=None):
+def _node(id_, depends_on=None, content="hi", model="auto", enable_tools=None, critique=False):
     return DagNodeRequest(
         id=id_, depends_on=depends_on or [], messages=[{"role": "user", "content": content}],
-        model=model, enable_tools=enable_tools or [],
+        model=model, enable_tools=enable_tools or [], critique=critique,
     )
 
 
@@ -189,3 +189,76 @@ async def test_node_requesting_an_unregistered_tool_falls_back_to_a_plain_call(t
 
     assert result.status == "success"
     assert result.nodes[0].response.choices[0].message["content"] == "plain answer"
+
+
+# --- critique (Phase 3: per-node review) --------------------------------------
+
+def _critique_tool_call(satisfied: bool, feedback: str = "") -> dict:
+    import json as _json
+
+    return {
+        "id": "call_1", "type": "function",
+        "function": {"name": "submit_critique", "arguments": _json.dumps({"satisfied": satisfied, "feedback": feedback})},
+    }
+
+
+@pytest.mark.asyncio
+async def test_node_without_critique_never_triggers_a_review_call(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"content": "plain answer"}})
+    result = await DagExecutor(engine).run(DagRunRequest(nodes=[_node("a", content="hi")]))
+
+    assert result.status == "success"
+    assert result.nodes[0].critique is None
+    assert engine.ctx.providers.get("solo").call_count == 1  # no review call at all
+
+
+@pytest.mark.asyncio
+async def test_node_with_critique_satisfied_first_try(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"content": "a good answer"},
+        {"tool_calls": [_critique_tool_call(True)]},
+    ]}})
+    result = await DagExecutor(engine).run(DagRunRequest(nodes=[_node("a", content="hi", critique=True)]))
+
+    assert result.status == "success"
+    assert result.nodes[0].critique.satisfied is True
+    assert result.nodes[0].response.choices[0].message["content"] == "a good answer"
+
+
+@pytest.mark.asyncio
+async def test_node_with_critique_unsatisfied_then_satisfied_reruns_the_node(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"content": "a weak answer"},
+        {"tool_calls": [_critique_tool_call(False, "needs more detail")]},
+        {"content": "a much better answer"},
+        {"tool_calls": [_critique_tool_call(True)]},
+    ]}})
+    result = await DagExecutor(engine, max_critique_retries=1).run(
+        DagRunRequest(nodes=[_node("a", content="hi", critique=True)])
+    )
+
+    assert result.status == "success"
+    assert result.nodes[0].critique.satisfied is True
+    assert result.nodes[0].response.choices[0].message["content"] == "a much better answer"
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 4  # node + critique + rerun + critique
+
+
+@pytest.mark.asyncio
+async def test_node_with_critique_gives_up_after_exhausting_retries_but_still_succeeds(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"content": "attempt 1"},
+        {"tool_calls": [_critique_tool_call(False, "nope")]},
+        {"content": "attempt 2"},
+        {"tool_calls": [_critique_tool_call(False, "still nope")]},
+    ]}})
+    result = await DagExecutor(engine, max_critique_retries=1).run(
+        DagRunRequest(nodes=[_node("a", content="hi", critique=True)])
+    )
+
+    # The node itself still succeeds -- critique is a best-effort review,
+    # not a pass/fail gate on the node's own status.
+    assert result.status == "success"
+    assert result.nodes[0].critique.satisfied is False
+    assert result.nodes[0].critique.feedback == "still nope"
+    assert result.nodes[0].response.choices[0].message["content"] == "attempt 2"

@@ -20,7 +20,16 @@ If a node fails, everything that (transitively) depends on it is marked
 "skipped" rather than attempted — a downstream node whose prompt is
 supposed to reference a failed upstream node's output has nothing
 meaningful to substitute in, so running it anyway would be worse than not
-running it. Nodes unrelated to the failure still run normally."""
+running it. Nodes unrelated to the failure still run normally.
+
+A node can opt into two further, per-node behaviors layered on top of the
+plain handle_chat() call, in `_run_node`'s `responder`: `enable_tools`
+(app/execution/tool_loop.py — XRouter itself executes a bounded call ->
+tool -> call loop) and `critique` (app/execution/critique_loop.py — the
+Critic, app/intelligence/critic.py, reviews the node's own output against
+its own instruction and the node re-runs through the same `responder` if
+unsatisfied). Neither one duplicates handle_chat()'s own routing/caching/
+circuit-breaking logic; both just wrap the same call."""
 from __future__ import annotations
 
 import asyncio
@@ -32,6 +41,7 @@ from app.contracts.dag import DagNodeRequest, DagNodeResult, DagRunRequest, DagR
 from app.contracts.request import ChatCompletionRequest
 from app.contracts.response import extract_message_text
 from app.core.errors import NoAvailableModelError, XRouterError
+from app.execution.critique_loop import DEFAULT_MAX_CRITIQUE_RETRIES, run_with_critique
 from app.execution.tool_loop import DEFAULT_MAX_TOOL_ITERATIONS, run_with_tools
 from app.tools.registry import ToolRegistry
 from app.utils.ids import new_id
@@ -110,6 +120,7 @@ class DagExecutor:
     def __init__(
         self, engine: "ChatEngine", max_nodes: int = 20,
         tools: ToolRegistry | None = None, max_tool_iterations: int = DEFAULT_MAX_TOOL_ITERATIONS,
+        max_critique_retries: int = DEFAULT_MAX_CRITIQUE_RETRIES,
     ):
         self._engine = engine
         self._max_nodes = max_nodes
@@ -119,6 +130,7 @@ class DagExecutor:
         # unconfigured" path in XRouter.
         self._tools = tools if tools is not None else ToolRegistry()
         self._max_tool_iterations = max_tool_iterations
+        self._max_critique_retries = max_critique_retries
 
     async def run(self, dag: DagRunRequest) -> DagRunResponse:
         start = time.time()
@@ -156,13 +168,30 @@ class DagExecutor:
     async def _run_node(self, node: DagNodeRequest, outputs: dict[str, str]) -> DagNodeResult:
         node_start = time.time()
         request = _build_request(node, outputs)
-        try:
+
+        async def responder(req: ChatCompletionRequest):
             if node.enable_tools:
-                response = await run_with_tools(
-                    self._engine, request, self._tools, node.enable_tools, max_iterations=self._max_tool_iterations,
+                return await run_with_tools(
+                    self._engine, req, self._tools, node.enable_tools, max_iterations=self._max_tool_iterations,
                 )
-            else:
-                response = await self._engine.handle_chat(request)
-            return DagNodeResult(id=node.id, status="success", response=response, latency_ms=round((time.time() - node_start) * 1000, 1))
+            return await self._engine.handle_chat(req)
+
+        try:
+            response = await responder(request)
+            critique_result = None
+            if node.critique:
+                # Reruns through the exact same responder (plain call, or
+                # the tool loop when enable_tools is also set) -- the
+                # critique loop never needs its own provider-calling
+                # logic, same reuse principle every execution module here
+                # follows.
+                response, critique_result = await run_with_critique(
+                    self._engine, request, response, responder,
+                    routing_policy=node.routing_policy, max_retries=self._max_critique_retries,
+                )
+            return DagNodeResult(
+                id=node.id, status="success", response=response, critique=critique_result,
+                latency_ms=round((time.time() - node_start) * 1000, 1),
+            )
         except NoAvailableModelError as e:
             return DagNodeResult(id=node.id, status="failed", error=str(e), latency_ms=round((time.time() - node_start) * 1000, 1))

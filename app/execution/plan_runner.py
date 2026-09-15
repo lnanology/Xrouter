@@ -62,6 +62,7 @@ async def run_plan_with_verification(
         dag_result = await DagExecutor(
             engine, max_nodes=max_nodes,
             tools=engine.ctx.tools, max_tool_iterations=engine.ctx.settings.routing.max_tool_iterations,
+            max_critique_retries=engine.ctx.settings.routing.max_critique_retries,
         ).run(to_dag_request(plan))
 
         if not plan_request.verify:

@@ -44,6 +44,13 @@ class PlanNodeSpec(BaseModel):
     # /v1/chat/completions request accepts. None lets the classifier/
     # default policy decide, same as any other node.
     routing_policy: str | None = None
+    # Per-node review (app/intelligence/critic.py, app/execution/
+    # critique_loop.py): the model sets this true for a step whose
+    # correctness genuinely matters and is easy to get subtly wrong in
+    # one shot (e.g. a final synthesis step) -- false (the default) for
+    # most steps, since a critique costs an extra call and a possible
+    # re-run of that one node.
+    critique: bool = False
 
     @field_validator("depends_on", "enable_tools", mode="before")
     @classmethod

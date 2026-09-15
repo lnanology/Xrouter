@@ -23,6 +23,7 @@ async def run_dag(request: Request, body: DagRunRequest):
     executor = DagExecutor(
         engine, max_nodes=ctx.settings.routing.max_dag_nodes,
         tools=ctx.tools, max_tool_iterations=ctx.settings.routing.max_tool_iterations,
+        max_critique_retries=ctx.settings.routing.max_critique_retries,
     )
     try:
         return await executor.run(body)

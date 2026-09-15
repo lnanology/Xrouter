@@ -208,6 +208,24 @@ def test_to_dag_request_carries_enable_tools_and_routing_policy_through():
     assert dag.nodes[0].routing_policy == "quality"
 
 
+def test_plan_tool_schema_always_offers_a_critique_property():
+    schema = _build_plan_tool_schema([])
+    node_props = schema["function"]["parameters"]["properties"]["nodes"]["items"]["properties"]
+    assert node_props["critique"]["type"] == "boolean"
+
+
+def test_to_dag_request_carries_critique_through():
+    plan = PlanSpec(nodes=[PlanNodeSpec(id="a", prompt="synthesize the final answer", critique=True)])
+    dag = to_dag_request(plan)
+    assert dag.nodes[0].critique is True
+
+
+def test_to_dag_request_critique_defaults_false():
+    plan = PlanSpec(nodes=[PlanNodeSpec(id="a", prompt="hi")])
+    dag = to_dag_request(plan)
+    assert dag.nodes[0].critique is False
+
+
 def test_validate_plan_shape_rejects_a_hallucinated_unavailable_tool():
     plan = PlanSpec(nodes=[PlanNodeSpec(id="a", prompt="hi", enable_tools=["not_a_real_tool"])])
     with pytest.raises(PlannerError, match="unknown/unavailable tool"):

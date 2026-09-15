@@ -70,6 +70,15 @@ def _build_plan_tool_schema(available_tools: list[str]) -> dict[str, Any]:
             "enum": _ROUTING_POLICIES,
             "description": "Optional: override the routing policy for this specific step (e.g. 'quality' for a final synthesis step). Omit to let XRouter choose automatically.",
         },
+        "critique": {
+            "type": "boolean",
+            "description": (
+                "Set true only for a step whose correctness genuinely matters and is easy to "
+                "get subtly wrong in one shot (e.g. a final synthesis step) -- a reviewer will "
+                "check this step's own output against this step's own instruction and it will "
+                "be redone if unsatisfied. Omit or set false for most steps."
+            ),
+        },
     }
     if available_tools:
         node_properties["enable_tools"] = {
@@ -176,7 +185,7 @@ def to_dag_request(plan: PlanSpec) -> DagRunRequest:
     return DagRunRequest(nodes=[
         DagNodeRequest(
             id=n.id, depends_on=n.depends_on, messages=[ChatMessage(role="user", content=n.prompt)],
-            enable_tools=n.enable_tools, routing_policy=n.routing_policy,
+            enable_tools=n.enable_tools, routing_policy=n.routing_policy, critique=n.critique,
         )
         for n in plan.nodes
     ])
