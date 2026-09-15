@@ -29,6 +29,8 @@ EVENT_TYPES = [
     "fallback.triggered",
     "quality.failed",
     "routing.changed",
+    "race.started",
+    "race.completed",
 ]
 
 

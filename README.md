@@ -7,9 +7,10 @@ other OpenAI-compatible endpoint), with health checking, circuit breaking,
 bounded retries, quota-aware fallback, streaming, and caching.
 
 This is **Phase 1** (fast, stable, low-cost, recoverable — no agents, no
-Kubernetes/Kafka/Redis, no quota/CAPTCHA/IP bypass of any kind) plus the
-first two pieces of **Phase 2**: a request-level task classifier and a
-telemetry-driven performance controller that auto-tunes routing weights.
+Kubernetes/Kafka/Redis, no quota/CAPTCHA/IP bypass of any kind) plus three
+pieces of **Phase 2**: a request-level task classifier, a telemetry-driven
+performance controller that auto-tunes routing weights, and an opt-in race
+mode that dispatches the top candidates concurrently.
 
 ## Quick start
 
@@ -52,11 +53,12 @@ provider:
   gracefully.
 - `.env` (copy from `.env.example`) — the actual secret values. Never
   committed (see `.gitignore`).
-- `config/routing.yaml` — default routing policy, fallback depth, and
+- `config/routing.yaml` — default routing policy, fallback depth,
   `task_aware_policy` (default `true`) — when on, each request is
   classified (chat/code/research/reasoning/creative/tool_use +
   complexity) and routed under the policy that classification suggests,
-  unless the client passes an explicit `routing_policy`.
+  unless the client passes an explicit `routing_policy` — and
+  `race_mode_enabled` / `race_candidate_count` (see Race mode below).
 - `config/models.yaml` — optional score overrides per model, applied on top
   of whatever each adapter self-reports.
 
@@ -109,6 +111,28 @@ curl -X POST http://localhost:20128/admin/providers/groq/disable  -H "Authorizat
 curl -X POST "http://localhost:20128/admin/providers/groq/cooldown?seconds=60" -H "Authorization: Bearer $TOKEN"
 ```
 
+### Race mode
+
+Off by default (`routing.race_mode_enabled: false` in `config/routing.yaml`)
+so a misconfigured server never starts silently burning quota on multiple
+providers per request. Turn it on server-wide, then opt individual
+requests in with `"race": true`:
+
+```bash
+curl http://localhost:20128/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "auto", "messages": [{"role": "user", "content": "hello"}], "race": true}'
+```
+
+XRouter dispatches the top `routing.race_candidate_count` ranked
+candidates (default 2) concurrently, returns whichever answers first, and
+cancels whatever's still in flight — the response's `xrouter` metadata
+carries `"race": true` and `"race_candidates": N` so you can see it
+happened. If every raced candidate fails, XRouter falls back to the
+remaining candidates one at a time, same as the non-race path. Race mode
+only applies to non-streaming requests in this phase — `stream: true`
+silently ignores the `race` flag (see `app/execution/race.py` for why).
+
 ## Tests
 
 ```bash
@@ -116,17 +140,20 @@ source .venv/bin/activate
 pytest -q
 ```
 
-84 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
-`tests/providers`, `tests/integration` — circuit breaker state machine,
-bounded retry/backoff, quota risk escalation, cache TTL/volatility rules,
-router scoring/exclusion rules, fallback chains (timeout/429/500/mid-stream
-failure), provider adapters against mocked HTTP (Ollama + generic
-OpenAI-compatible), full-stack FastAPI integration tests (including the
-"no provider reachable" degraded-but-alive path and graceful shutdown), the
-task classifier (task-type detection, complexity scoring, suggested
-policy, tool-use override), and the performance controller (neutral below
-`MIN_SAMPLES`, EMA latency/success weighting, graceful start/stop of its
-background snapshot loop).
+94 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+`tests/execution`, `tests/providers`, `tests/integration` — circuit
+breaker state machine, bounded retry/backoff, quota risk escalation,
+cache TTL/volatility rules, router scoring/exclusion rules, fallback
+chains (timeout/429/500/mid-stream failure), provider adapters against
+mocked HTTP (Ollama + generic OpenAI-compatible), full-stack FastAPI
+integration tests (including the "no provider reachable" degraded-but-alive
+path and graceful shutdown), the task classifier (task-type detection,
+complexity scoring, suggested policy, tool-use override), the performance
+controller (neutral below `MIN_SAMPLES`, EMA latency/success weighting,
+graceful start/stop of its background snapshot loop), and race mode
+(fastest-candidate-wins, loser cancellation, all-raced-failed fallback,
+`race.started`/`race.completed` events, candidate-count clamping, and the
+server-switch/per-request-opt-in/no-streaming gating logic).
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -163,15 +190,24 @@ latency/success tracking (neutral until `MIN_SAMPLES=10`, to avoid
 oscillation from small sample sizes) feeding a weight multiplier into the
 scorer, with a background loop persisting snapshots to `routing_metrics`
 and emitting `routing.changed` events on significant weight shifts;
-visible live via `/admin/metrics`.
+visible live via `/admin/metrics`. Race Mode (`app/execution/race.py`) —
+opt-in (`routing.race_mode_enabled` + per-request `"race": true`)
+concurrent dispatch of the top `race_candidate_count` ranked candidates
+for non-streaming chat completions, returning whichever answers first and
+cancelling the rest; reuses the exact same breaker/quota/retry/performance
+bookkeeping as the sequential fallback chain via a shared
+`try_candidate()` helper, and falls back to the remaining candidates
+sequentially if every raced one fails.
 
 ## What's not implemented yet (by design — see Phase 2-5 in the spec)
 
 Task-complexity-driven multi-agent orchestration (Planner/Researcher/
-Critic/Verifier), DAG executor, race mode, confidence/quality-gate engine,
-RAG/memory, plugin loader, browser/web-AI adapter, network failover/VPN
-layer, PostgreSQL migration. Their directories exist as reserved, empty
-packages (`app/agents`, `app/execution/{race,dag,cancellation}.py`,
+Critic/Verifier), DAG executor, confidence/quality-gate engine, RAG/memory,
+plugin loader, browser/web-AI adapter, network failover/VPN layer,
+PostgreSQL migration, and streaming race mode (race mode above only covers
+non-streaming requests — racing partial token streams needs its own
+buffering/cancellation design). Their directories exist as reserved, empty
+packages (`app/agents`, `app/execution/{dag,cancellation}.py`,
 `app/network`, `app/plugins`) so the rest of Phase 2+ has a home without
 restructuring what's already built.
 

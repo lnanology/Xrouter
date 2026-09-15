@@ -3,6 +3,7 @@ Provider interface every real adapter implements, so router/fallback/
 circuit-breaker tests never need real network access or Ollama installed."""
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterator
 
 from app.contracts.model import ModelInfo
@@ -19,12 +20,17 @@ class FakeProvider(Provider):
     behavior: "success" | "timeout" | "rate_limit" | "server_error" | "auth_error" | callable
     """
 
-    def __init__(self, config: ProviderConfig, models: list[ModelInfo], behavior="success", fail_after_chunks: int | None = None):
+    def __init__(
+        self, config: ProviderConfig, models: list[ModelInfo], behavior="success",
+        fail_after_chunks: int | None = None, delay_seconds: float = 0.0,
+    ):
         super().__init__(config)
         self._models = models
         self.behavior = behavior
         self.fail_after_chunks = fail_after_chunks
+        self.delay_seconds = delay_seconds
         self.call_count = 0
+        self.cancelled = False
 
     def capabilities(self) -> set[ProviderCapability]:
         return {ProviderCapability.CHAT, ProviderCapability.STREAMING}
@@ -58,6 +64,12 @@ class FakeProvider(Provider):
             raise ProviderAuthError("simulated bad key", provider_id=self.id)
 
     async def chat(self, model: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
+        if self.delay_seconds:
+            try:
+                await asyncio.sleep(self.delay_seconds)
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
         self._maybe_raise()
         return ChatCompletionResponse(
             model=f"{self.id}/{model}",

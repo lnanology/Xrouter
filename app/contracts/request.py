@@ -31,6 +31,11 @@ class ChatCompletionRequest(BaseModel):
     # XRouter extensions (all optional, ignored by plain OpenAI clients)
     routing_policy: str | None = None
     x_cache: bool | None = None
+    # Phase 2 race mode (section 三十六): race the top-N ranked candidates
+    # concurrently and return whichever answers first. Only takes effect
+    # when the server-wide routing.race_mode_enabled switch is also on, and
+    # only for non-streaming requests (stream=true ignores this flag).
+    race: bool = False
 
 
 class XRouterRequestContext(BaseModel):

@@ -12,6 +12,7 @@ from app.contracts.request import ChatCompletionRequest
 from app.contracts.response import ChatCompletionChunk, ChatCompletionResponse
 from app.core.context import AppContext
 from app.core.errors import NoAvailableModelError
+from app.execution.race import run_race
 from app.intelligence.task_classifier import TaskClassification, classify
 from app.observability.logging import get_logger
 from app.routing.fallback import run_chat, run_stream_chat
@@ -34,6 +35,12 @@ class ChatEngine:
         if self.ctx.settings.routing.task_aware_policy:
             return classification.suggested_policy
         return self.ctx.settings.routing.default_policy
+
+    def _use_race(self, request: ChatCompletionRequest) -> bool:
+        """Race mode (section 三十六) needs both the server-wide switch on
+        and an explicit per-request opt-in, and only ever applies to
+        non-streaming requests — see app/execution/race.py for why."""
+        return bool(self.ctx.settings.routing.race_mode_enabled and request.race and not request.stream)
 
     async def handle_chat(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         request_id = new_id("req")
@@ -77,11 +84,21 @@ class ChatEngine:
             attempts_seen.append(attempt)
 
         try:
-            response, attempts = await run_chat(
-                decision, self.ctx.providers, self.ctx.circuits, self.ctx.quota, self.ctx.limiter,
-                request, self.ctx.settings.routing.max_fallback_attempts, on_attempt=_on_attempt,
-                performance=self.ctx.performance,
-            )
+            if self._use_race(request):
+                response, attempts = await run_race(
+                    decision, self.ctx.providers, self.ctx.circuits, self.ctx.quota, self.ctx.limiter,
+                    request, self.ctx.settings.routing.max_fallback_attempts,
+                    self.ctx.settings.routing.race_candidate_count,
+                    events=self.ctx.events, performance=self.ctx.performance,
+                )
+                for a in attempts:
+                    _on_attempt(a)
+            else:
+                response, attempts = await run_chat(
+                    decision, self.ctx.providers, self.ctx.circuits, self.ctx.quota, self.ctx.limiter,
+                    request, self.ctx.settings.routing.max_fallback_attempts, on_attempt=_on_attempt,
+                    performance=self.ctx.performance,
+                )
         except NoAvailableModelError as e:
             record.status = "failed"
             record.error = str(e)

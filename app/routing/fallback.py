@@ -34,6 +34,64 @@ def _candidates(decision: RoutingDecision) -> list[RoutingCandidate]:
     return [decision.primary, *decision.fallback_chain]
 
 
+async def try_candidate(
+    idx: int,
+    candidate: RoutingCandidate,
+    providers: ProviderRegistry,
+    circuits: CircuitBreakerRegistry,
+    quota: QuotaTracker,
+    limiter: ConcurrencyLimiter,
+    request: ChatCompletionRequest,
+    performance: PerformanceController | None = None,
+) -> tuple[ChatCompletionResponse | None, dict]:
+    """Runs a single candidate attempt end-to-end (breaker admission ->
+    concurrency admission -> bounded timeout -> bounded retry -> breaker/
+    quota/performance bookkeeping) and never raises ProviderError itself —
+    it returns (None, attempt_log_entry) on any failure instead of raising,
+    so both the sequential fallback chain (run_chat, below) and race mode
+    (app/execution/race.py) can share one implementation of this bookkeeping
+    without either having to catch the other's exceptions."""
+    provider = providers.get(candidate.provider_id)
+    breaker = circuits.get(candidate.provider_id)
+    if provider is None or not breaker.allow_request():
+        return None, {"provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "skipped"}
+
+    start = time.time()
+    quota.record_request(candidate.provider_id)
+    try:
+        async def _call():
+            return await provider.chat(candidate.model_id, request)
+
+        response = await retry_with_backoff(
+            lambda: execute_attempt(candidate.provider_id, limiter, provider.config.timeout_seconds, _call),
+            RetryConfig(),
+        )
+        latency_ms = (time.time() - start) * 1000
+        breaker.record_success()
+        quota.record_success(candidate.provider_id)
+        quota.record_tokens(candidate.provider_id, response.usage.total_tokens)
+        if performance is not None:
+            performance.record(candidate.provider_id, latency_ms, success=True)
+        response.xrouter = {
+            "provider": candidate.provider_id,
+            "model": candidate.model_id,
+            "attempt_index": idx,
+            "latency_ms": round(latency_ms, 1),
+        }
+        return response, {"provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "success", "latency_ms": latency_ms}
+    except ProviderError as e:
+        latency_ms = (time.time() - start) * 1000
+        breaker.record_failure()
+        if isinstance(e, ProviderRateLimitError):
+            quota.record_rate_limit(candidate.provider_id, e.retry_after)
+        if performance is not None:
+            performance.record(candidate.provider_id, latency_ms, success=False)
+        return None, {
+            "provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "failed",
+            "latency_ms": latency_ms, "error": str(e),
+        }
+
+
 async def run_chat(
     decision: RoutingDecision,
     providers: ProviderRegistry,
@@ -47,55 +105,13 @@ async def run_chat(
 ) -> tuple[ChatCompletionResponse, list[dict]]:
     attempts_log: list[dict] = []
     for idx, candidate in enumerate(_candidates(decision)[:max_attempts]):
-        provider = providers.get(candidate.provider_id)
-        breaker = circuits.get(candidate.provider_id)
-        if provider is None or not breaker.allow_request():
-            attempts_log.append({"provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "skipped"})
-            continue
-
-        start = time.time()
-        quota.record_request(candidate.provider_id)
-        try:
-            async def _call():
-                return await provider.chat(candidate.model_id, request)
-
-            response = await retry_with_backoff(
-                lambda: execute_attempt(candidate.provider_id, limiter, provider.config.timeout_seconds, _call),
-                RetryConfig(),
-            )
-            latency_ms = (time.time() - start) * 1000
-            breaker.record_success()
-            quota.record_success(candidate.provider_id)
-            quota.record_tokens(candidate.provider_id, response.usage.total_tokens)
-            if performance is not None:
-                performance.record(candidate.provider_id, latency_ms, success=True)
-            response.xrouter = {
-                "provider": candidate.provider_id,
-                "model": candidate.model_id,
-                "policy": decision.policy,
-                "attempt_index": idx,
-                "latency_ms": round(latency_ms, 1),
-            }
-            attempt = {"provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "success", "latency_ms": latency_ms}
-            attempts_log.append(attempt)
-            if on_attempt:
-                on_attempt(attempt)
+        response, attempt = await try_candidate(idx, candidate, providers, circuits, quota, limiter, request, performance)
+        attempts_log.append(attempt)
+        if on_attempt:
+            on_attempt(attempt)
+        if response is not None:
+            response.xrouter["policy"] = decision.policy
             return response, attempts_log
-        except ProviderError as e:
-            latency_ms = (time.time() - start) * 1000
-            breaker.record_failure()
-            if isinstance(e, ProviderRateLimitError):
-                quota.record_rate_limit(candidate.provider_id, e.retry_after)
-            if performance is not None:
-                performance.record(candidate.provider_id, latency_ms, success=False)
-            attempt = {
-                "provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "failed",
-                "latency_ms": latency_ms, "error": str(e),
-            }
-            attempts_log.append(attempt)
-            if on_attempt:
-                on_attempt(attempt)
-            continue
 
     raise NoAvailableModelError("All candidates in the fallback chain failed.", attempts=attempts_log)
 

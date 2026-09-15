@@ -43,6 +43,10 @@ class RoutingConfig:
     default_policy: str = "balanced"
     max_fallback_attempts: int = 3
     race_mode_enabled: bool = False
+    # How many top-ranked candidates a raced request dispatches concurrently
+    # (only relevant when race_mode_enabled is True and the client requests
+    # race=true). Clamped at use to [1, number of available candidates].
+    race_candidate_count: int = 2
     # Phase 2: when true, an unspecified client `routing_policy` is chosen
     # by the Task Classifier (task type + complexity) instead of always
     # falling back to `default_policy`. `default_policy` is still used when
@@ -98,6 +102,7 @@ class Settings:
             default_policy=routing_raw.get("default_policy", "balanced"),
             max_fallback_attempts=int(routing_raw.get("max_fallback_attempts", 3)),
             race_mode_enabled=bool(routing_raw.get("race_mode_enabled", False)),
+            race_candidate_count=int(routing_raw.get("race_candidate_count", 2)),
             task_aware_policy=bool(routing_raw.get("task_aware_policy", True)),
         )
 

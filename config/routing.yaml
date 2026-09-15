@@ -2,6 +2,8 @@ routing:
   default_policy: balanced   # fastest | cheapest | reliable | quota_aware | quality | balanced
   max_fallback_attempts: 3
   race_mode_enabled: false   # optional; off by default to avoid burning free-tier quota
+  race_candidate_count: 2    # how many top candidates to race concurrently when race_mode_enabled
+                              # is true and a request sets "race": true (non-streaming only)
   # Phase 2: let the Task Classifier pick a policy per-request (task type +
   # complexity) instead of always using default_policy. A client-supplied
   # routing_policy in the request body always wins over both.
