@@ -32,6 +32,14 @@ class DagNodeRequest(BaseModel):
     max_tokens: int | None = None
     tools: list[dict[str, Any]] | None = None
     tool_choice: Any | None = None
+    # Names of XRouter-registered tools (app/tools/registry.py, e.g.
+    # "web_search") this node may use. Distinct from `tools` above, which
+    # is passed straight through for the *client* to execute, per the
+    # standard OpenAI contract -- a name listed here is instead executed
+    # by XRouter itself (app/execution/tool_loop.py): the call -> tool ->
+    # call round-trip happens inside this one node, bounded by
+    # routing.max_tool_iterations, before the node's result comes back.
+    enable_tools: list[str] = Field(default_factory=list)
 
 
 class DagRunRequest(BaseModel):

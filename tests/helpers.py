@@ -119,7 +119,57 @@ class FakeProvider(Provider):
             )
 
 
-async def build_test_engine(tmp_path, provider_specs: dict[str, dict], **routing_overrides):
+class FakeTool:
+    """Scriptable ExecutableTool test double (app/tools/base.py's
+    ExecutableTool Protocol) — lets tool_loop/DAG/Planner tests exercise
+    enable_tools end-to-end without a real Tavily (or other) API key.
+
+    behavior: "success" | "error"
+    """
+
+    def __init__(
+        self, name: str = "web_search", schema: dict | None = None,
+        behavior: str = "success", result: str = "fake tool result", configured: bool = True,
+    ):
+        self.name = name
+        self.schema = schema or {
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": "fake tool for tests",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"],
+                },
+            },
+        }
+        self.behavior = behavior
+        self.result = result
+        self._configured = configured
+        # Every set of arguments this tool was ever executed with, in
+        # order — lets a test assert a tool call actually happened (and
+        # with what arguments) rather than just trusting the final text.
+        self.calls: list[dict] = []
+        self.closed = False
+
+    @property
+    def configured(self) -> bool:
+        return self._configured
+
+    async def execute(self, arguments: dict) -> str:
+        self.calls.append(arguments)
+        if self.behavior == "error":
+            from app.core.errors import ToolExecutionError
+
+            raise ToolExecutionError("simulated tool failure")
+        return self.result
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def build_test_engine(tmp_path, provider_specs: dict[str, dict], tool_specs: dict[str, dict] | None = None, **routing_overrides):
     """Assembles a real ChatEngine wired to FakeProviders instead of real
     adapters — the same pieces app.core.lifecycle.startup() assembles into
     an AppContext, minus config-driven provider construction. Lets tests
@@ -128,6 +178,11 @@ async def build_test_engine(tmp_path, provider_specs: dict[str, dict], **routing
 
     provider_specs: {provider_id: {kwarg: value, ...}} passed straight
     through to FakeProvider (behavior, content, delay_seconds, ...).
+    tool_specs: {tool_name: {kwarg: value, ...}} passed straight through
+    to FakeTool (behavior, result, configured, ...) and registered into
+    the AppContext's ToolRegistry — omit for an empty registry (every
+    enable_tools request then simply has nothing available, the same
+    graceful "not configured" path a real unconfigured tool takes).
     routing_overrides: passed straight through to RoutingConfig; defaults
     task_aware_policy to False so tests get a predictable routing policy
     unless they override it."""
@@ -147,6 +202,7 @@ async def build_test_engine(tmp_path, provider_specs: dict[str, dict], **routing
     from app.storage.repositories.model import ModelRepository
     from app.storage.repositories.provider import ProviderRepository
     from app.storage.repositories.request import RequestRepository
+    from app.tools.registry import ToolRegistry
 
     db_path = str(tmp_path / "test.sqlite3")
     db = Database(db_path)
@@ -168,6 +224,10 @@ async def build_test_engine(tmp_path, provider_specs: dict[str, dict], **routing
     events = EventBus()
     metrics = MetricsCollector()
 
+    tools = ToolRegistry()
+    for tname, tspec in (tool_specs or {}).items():
+        tools.register(FakeTool(name=tname, **tspec))
+
     routing_defaults = {"task_aware_policy": False}
     routing_defaults.update(routing_overrides)
     routing = RoutingConfig(**routing_defaults)
@@ -180,7 +240,7 @@ async def build_test_engine(tmp_path, provider_specs: dict[str, dict], **routing
         settings=settings, providers=providers, models=models, circuits=circuits, quota=quota,
         router=router, limiter=limiter, cache=cache, metrics=metrics, events=events, db=db,
         provider_repo=ProviderRepository(db), model_repo=ModelRepository(db), request_repo=RequestRepository(db),
-        metrics_repo=MetricsRepository(db), health_monitor=None, performance=None,
+        metrics_repo=MetricsRepository(db), health_monitor=None, performance=None, tools=tools,
     )
     return ChatEngine(ctx)
 

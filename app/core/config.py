@@ -71,12 +71,27 @@ class RoutingConfig:
     # verification (PlanRequest.verify=true) can trigger a fresh
     # plan+execute cycle. Only consulted when the request opts in.
     max_verify_retries: int = 1
+    # Tool-execution loop (Phase 3): how many call -> tool -> call
+    # round-trips a single node's XRouter-executed tool use may take
+    # (DagNodeRequest.enable_tools) before giving up and returning
+    # whatever the model last said, rather than looping forever.
+    max_tool_iterations: int = 3
     # Phase 2: when true, an unspecified client `routing_policy` is chosen
     # by the Task Classifier (task type + complexity) instead of always
     # falling back to `default_policy`. `default_policy` is still used when
     # this is false, and still wins for any task type the classifier can't
     # place confidently.
     task_aware_policy: bool = True
+
+
+@dataclass
+class ToolConfig:
+    id: str
+    enabled: bool = False
+    api_key_env: str | None = None
+    base_url: str | None = None
+    timeout_seconds: float = 10.0
+    extra: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -97,6 +112,7 @@ class Settings:
     providers: dict[str, ProviderConfig]
     raw_routing: dict[str, Any]
     model_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
+    tools: dict[str, ToolConfig] = field(default_factory=dict)
 
     @classmethod
     def load(cls, config_dir: Path | None = None) -> "Settings":
@@ -108,6 +124,7 @@ class Settings:
         raw_routing = _load_yaml(cdir / "routing.yaml")
         raw_models = _load_yaml(cdir / "models.yaml")
         model_overrides = raw_models.get("models", {}) or {}
+        raw_tools = _load_yaml(cdir / "tools.yaml")
 
         server_raw = raw_config.get("server", {})
         server = ServerConfig(
@@ -134,6 +151,7 @@ class Settings:
             planner_routing_policy=routing_raw.get("planner_routing_policy", "quality"),
             max_plan_retries=int(routing_raw.get("max_plan_retries", 2)),
             max_verify_retries=int(routing_raw.get("max_verify_retries", 1)),
+            max_tool_iterations=int(routing_raw.get("max_tool_iterations", 3)),
             task_aware_policy=bool(routing_raw.get("task_aware_policy", True)),
         )
 
@@ -160,6 +178,17 @@ class Settings:
                 extra=pcfg.get("extra", {}) or {},
             )
 
+        tools: dict[str, ToolConfig] = {}
+        for tid, tcfg in (raw_tools.get("tools") or {}).items():
+            tools[tid] = ToolConfig(
+                id=tid,
+                enabled=bool(tcfg.get("enabled", False)),
+                api_key_env=tcfg.get("api_key_env"),
+                base_url=tcfg.get("base_url"),
+                timeout_seconds=float(tcfg.get("timeout_seconds", 10.0)),
+                extra=tcfg.get("extra", {}) or {},
+            )
+
         if not server.admin_token:
             # Never leave /admin/* unauthenticated by default (section 三十三).
             server.admin_token = secrets.token_urlsafe(24)
@@ -171,7 +200,7 @@ class Settings:
 
         return cls(
             server=server, routing=routing, cache=cache, providers=providers,
-            raw_routing=raw_routing, model_overrides=model_overrides,
+            raw_routing=raw_routing, model_overrides=model_overrides, tools=tools,
         )
 
 

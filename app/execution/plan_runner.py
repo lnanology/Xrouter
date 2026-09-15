@@ -59,7 +59,10 @@ async def run_plan_with_verification(
 
     while True:
         plan, plan_attempts = await generate_plan(engine, current, max_nodes, max_retries=max_plan_retries)
-        dag_result = await DagExecutor(engine, max_nodes=max_nodes).run(to_dag_request(plan))
+        dag_result = await DagExecutor(
+            engine, max_nodes=max_nodes,
+            tools=engine.ctx.tools, max_tool_iterations=engine.ctx.settings.routing.max_tool_iterations,
+        ).run(to_dag_request(plan))
 
         if not plan_request.verify:
             return PlanRunResult(plan=plan, plan_attempts=plan_attempts, dag=dag_result, verification=None, replan_count=0)

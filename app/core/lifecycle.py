@@ -21,6 +21,7 @@ from app.storage.repositories.metrics import MetricsRepository
 from app.storage.repositories.model import ModelRepository
 from app.storage.repositories.provider import ProviderRepository
 from app.storage.repositories.request import RequestRepository
+from app.tools.factory import build_tool_registry
 
 logger = get_logger("lifecycle")
 
@@ -68,16 +69,19 @@ async def startup(settings: Settings | None = None) -> AppContext:
     health_monitor = HealthMonitor(providers, circuits, provider_repo, interval_seconds=20.0)
     health_monitor.start()
 
+    tools = build_tool_registry(settings)
+
     logger.info(
-        "startup complete: %d provider(s) configured, %d enabled, %d model(s) discovered",
+        "startup complete: %d provider(s) configured, %d enabled, %d model(s) discovered, %d tool(s) available",
         len(settings.providers), sum(1 for p in settings.providers if providers.is_enabled(p)), len(models.all()),
+        len(tools.available_names()),
     )
 
     return AppContext(
         settings=settings, providers=providers, models=models, circuits=circuits, quota=quota,
         router=router, limiter=limiter, cache=cache, metrics=metrics, events=events, db=db,
         provider_repo=provider_repo, model_repo=model_repo, request_repo=request_repo,
-        metrics_repo=metrics_repo, health_monitor=health_monitor, performance=performance,
+        metrics_repo=metrics_repo, health_monitor=health_monitor, performance=performance, tools=tools,
     )
 
 
@@ -86,4 +90,5 @@ async def shutdown(ctx: AppContext) -> None:
     await ctx.health_monitor.stop()
     await ctx.performance.stop()
     await ctx.providers.close_all()
+    await ctx.tools.close_all()
     logger.info("shutdown complete")

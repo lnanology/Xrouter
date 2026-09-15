@@ -41,45 +41,68 @@ logger = get_logger("intelligence.planner")
 
 PLAN_TOOL_NAME = "submit_plan"
 
-_PLAN_TOOL_SCHEMA: dict[str, Any] = {
-    "type": "function",
-    "function": {
-        "name": PLAN_TOOL_NAME,
-        "description": (
-            "Submit the execution plan: an explicit DAG of chat-completion "
-            "nodes that together accomplish the user's task."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "nodes": {
-                    "type": "array",
-                    "minItems": 1,
-                    "items": {
-                        "type": "object",
-                        "properties": {
-                            "id": {
-                                "type": "string",
-                                "description": "Short unique identifier for this step, e.g. 'research' or 'draft'.",
-                            },
-                            "depends_on": {
-                                "type": "array",
-                                "items": {"type": "string"},
-                                "description": "ids of nodes that must complete before this one runs. Omit or leave empty for a node with no dependencies.",
-                            },
-                            "prompt": {
-                                "type": "string",
-                                "description": "The exact instruction/message to send for this step. Reference an upstream node's output with {{node_id}}.",
-                            },
-                        },
-                        "required": ["id", "prompt"],
-                    },
-                }
-            },
-            "required": ["nodes"],
+_ROUTING_POLICIES = ["fastest", "cheapest", "reliable", "quota_aware", "quality", "balanced"]
+
+
+def _build_plan_tool_schema(available_tools: list[str]) -> dict[str, Any]:
+    """Builds the submit_plan tool schema for *this* call, offering only
+    the tools that are actually registered and configured right now
+    (available_tools comes from ToolRegistry.available_names()). A plan
+    can therefore never even syntactically request a tool that doesn't
+    exist -- there's nothing to hallucinate an id for if the enum doesn't
+    list it -- consistent with "no fake placeholder functionality"."""
+    node_properties: dict[str, Any] = {
+        "id": {
+            "type": "string",
+            "description": "Short unique identifier for this step, e.g. 'research' or 'draft'.",
         },
-    },
-}
+        "depends_on": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "ids of nodes that must complete before this one runs. Omit or leave empty for a node with no dependencies.",
+        },
+        "prompt": {
+            "type": "string",
+            "description": "The exact instruction/message to send for this step. Reference an upstream node's output with {{node_id}}.",
+        },
+        "routing_policy": {
+            "type": "string",
+            "enum": _ROUTING_POLICIES,
+            "description": "Optional: override the routing policy for this specific step (e.g. 'quality' for a final synthesis step). Omit to let XRouter choose automatically.",
+        },
+    }
+    if available_tools:
+        node_properties["enable_tools"] = {
+            "type": "array",
+            "items": {"type": "string", "enum": available_tools},
+            "description": (
+                "Real tools this step is allowed to use, if it genuinely needs current or "
+                "external information it can't answer from its own knowledge. Only include "
+                "a tool when the step actually needs it -- most steps need none."
+            ),
+        }
+
+    return {
+        "type": "function",
+        "function": {
+            "name": PLAN_TOOL_NAME,
+            "description": (
+                "Submit the execution plan: an explicit DAG of chat-completion "
+                "nodes that together accomplish the user's task."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "nodes": {
+                        "type": "array",
+                        "minItems": 1,
+                        "items": {"type": "object", "properties": node_properties, "required": ["id", "prompt"]},
+                    }
+                },
+                "required": ["nodes"],
+            },
+        },
+    }
 
 
 class PlannerError(XRouterError):
@@ -89,7 +112,21 @@ class PlannerError(XRouterError):
     this means it got answers, just never a good enough one."""
 
 
-def _build_planning_request(plan_request: PlanRequest, max_nodes: int) -> ChatCompletionRequest:
+def _build_planning_request(
+    plan_request: PlanRequest, max_nodes: int, available_tools: list[str] | None = None,
+) -> ChatCompletionRequest:
+    # available_tools defaults to "none" rather than being required -- lets
+    # existing/simple callers (and tests) that don't care about tools at
+    # all keep calling this with just (plan_request, max_nodes).
+    available_tools = available_tools or []
+    tool_note = (
+        f" The following real tools are available and may be assigned to a step via "
+        f"enable_tools: {', '.join(available_tools)}. Only assign a tool to a step that "
+        "genuinely needs it -- most steps need none."
+        if available_tools else
+        " No external tools are available right now -- every step must be answerable "
+        "from a model's own knowledge and reasoning."
+    )
     system = (
         "You are the planning stage of XRouter, an AI gateway. Break the "
         "user's task into an explicit dependency graph (DAG) of small, "
@@ -97,8 +134,8 @@ def _build_planning_request(plan_request: PlanRequest, max_nodes: int) -> ChatCo
         "doesn't need that many. Steps that don't depend on each other's "
         "output should be separate, independent nodes (independent nodes "
         "run concurrently). A node's prompt can reference an earlier "
-        "node's output with {{node_id}}. Call submit_plan with the graph "
-        "-- do not answer the task yourself."
+        "node's output with {{node_id}}." + tool_note +
+        " Call submit_plan with the graph -- do not answer the task yourself."
     )
     messages = [ChatMessage(role="system", content=system)]
     if plan_request.context:
@@ -108,7 +145,7 @@ def _build_planning_request(plan_request: PlanRequest, max_nodes: int) -> ChatCo
         model=plan_request.model,
         messages=messages,
         routing_policy=plan_request.routing_policy,
-        tools=[_PLAN_TOOL_SCHEMA],
+        tools=[_build_plan_tool_schema(available_tools)],
         tool_choice={"type": "function", "function": {"name": PLAN_TOOL_NAME}},
     )
 
@@ -137,19 +174,41 @@ def _parse_plan(raw: str) -> PlanSpec:
 
 def to_dag_request(plan: PlanSpec) -> DagRunRequest:
     return DagRunRequest(nodes=[
-        DagNodeRequest(id=n.id, depends_on=n.depends_on, messages=[ChatMessage(role="user", content=n.prompt)])
+        DagNodeRequest(
+            id=n.id, depends_on=n.depends_on, messages=[ChatMessage(role="user", content=n.prompt)],
+            enable_tools=n.enable_tools, routing_policy=n.routing_policy,
+        )
         for n in plan.nodes
     ])
 
 
-def _validate_plan_shape(plan: PlanSpec, max_nodes: int) -> None:
+def _validate_plan_shape(plan: PlanSpec, max_nodes: int, available_tools: list[str] | None = None) -> None:
     """Raises PlannerError if the plan can't become a runnable DAG -- too
-    many nodes, or a structurally bad graph (cycle, duplicate id, unknown
-    or self dependency). Reuses app.execution.dag's own validator so a
-    plan rejected here is guaranteed to be rejected inside the
-    DagExecutor for the identical reason, and vice versa."""
+    many nodes, a structurally bad graph (cycle, duplicate id, unknown or
+    self dependency), or a node requesting a tool that wasn't actually
+    offered. The last check matters even though the schema's enum already
+    constrains valid values: not every provider strictly enforces a JSON
+    schema enum on generated tool-call arguments, so a model can still
+    hallucinate a name outside it -- this catches that before it becomes
+    a node that silently runs with no tool at all (see
+    app/execution/tool_loop.py's own "not registered -> ignore" behavior,
+    which is the right call *at execution time* but would hide a planning
+    mistake if not also caught here). Reuses app.execution.dag's own
+    validator for the graph-shape check, so a plan rejected here is
+    guaranteed to be rejected inside the DagExecutor for the identical
+    reason, and vice versa."""
     if len(plan.nodes) > max_nodes:
         raise PlannerError(f"plan has {len(plan.nodes)} nodes, exceeding the {max_nodes}-node cap")
+
+    available = set(available_tools or [])
+    for n in plan.nodes:
+        unknown = [t for t in n.enable_tools if t not in available]
+        if unknown:
+            raise PlannerError(
+                f"node '{n.id}' requested unknown/unavailable tool(s) {unknown}; "
+                f"available tools are {sorted(available) or '(none)'}"
+            )
+
     try:
         _validate_and_order(to_dag_request(plan).nodes, max_nodes)
     except DagValidationError as e:
@@ -167,7 +226,8 @@ async def generate_plan(
     -- and only raises PlannerError once every retry has been spent on a
     plan that still isn't usable. Returns (plan, attempts_used) so callers
     can see whether the model got it right first try."""
-    request = _build_planning_request(plan_request, max_nodes)
+    available_tools = engine.ctx.tools.available_names()
+    request = _build_planning_request(plan_request, max_nodes, available_tools)
     last_error: PlannerError | None = None
 
     for attempt in range(max_retries + 1):
@@ -177,7 +237,7 @@ async def generate_plan(
             if raw is None:
                 raise PlannerError("planner did not call submit_plan with a tool call")
             plan = _parse_plan(raw)
-            _validate_plan_shape(plan, max_nodes)
+            _validate_plan_shape(plan, max_nodes, available_tools)
         except PlannerError as e:
             last_error = e
             logger.warning("plan attempt %d/%d rejected: %s", attempt + 1, max_retries + 1, e)

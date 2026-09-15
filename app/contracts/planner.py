@@ -32,13 +32,25 @@ class PlanNodeSpec(BaseModel):
     id: str
     depends_on: list[str] = Field(default_factory=list)
     prompt: str
+    # Names of XRouter-registered tools (app/tools/registry.py) this step
+    # may use -- only ever populated from the *available_tools* list the
+    # Planner was actually offered (app/intelligence/planner.py builds
+    # the submit_plan schema's enum from it), so a plan can never request
+    # a tool that doesn't exist; app/intelligence/planner.py's
+    # _validate_plan_shape() double-checks this itself rather than
+    # trusting the model to have honored the enum.
+    enable_tools: list[str] = Field(default_factory=list)
+    # Optional per-step override, same routing_policy values a plain
+    # /v1/chat/completions request accepts. None lets the classifier/
+    # default policy decide, same as any other node.
+    routing_policy: str | None = None
 
-    @field_validator("depends_on", mode="before")
+    @field_validator("depends_on", "enable_tools", mode="before")
     @classmethod
     def _coerce_none_to_empty(cls, v):
-        # Real models occasionally emit "depends_on": null for "no
-        # dependencies" instead of omitting the key or sending [] --
-        # tolerate that rather than failing the whole plan over it.
+        # Real models occasionally emit "depends_on": null (or the same
+        # for enable_tools) for "none" instead of omitting the key or
+        # sending [] -- tolerate that rather than failing the whole plan.
         return v or []
 
 

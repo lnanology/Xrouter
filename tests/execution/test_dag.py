@@ -2,11 +2,15 @@ import pytest
 
 from app.contracts.dag import DagNodeRequest, DagRunRequest
 from app.execution.dag import DagExecutor, DagValidationError, _substitute, _validate_and_order
-from tests.helpers import build_test_engine
+from app.tools.registry import ToolRegistry
+from tests.helpers import FakeTool, build_test_engine
 
 
-def _node(id_, depends_on=None, content="hi", model="auto"):
-    return DagNodeRequest(id=id_, depends_on=depends_on or [], messages=[{"role": "user", "content": content}], model=model)
+def _node(id_, depends_on=None, content="hi", model="auto", enable_tools=None):
+    return DagNodeRequest(
+        id=id_, depends_on=depends_on or [], messages=[{"role": "user", "content": content}],
+        model=model, enable_tools=enable_tools or [],
+    )
 
 
 # --- pure validation/ordering -----------------------------------------------
@@ -134,3 +138,54 @@ async def test_max_nodes_enforced_end_to_end(tmp_path):
     dag = DagRunRequest(nodes=[_node("a"), _node("b")])
     with pytest.raises(DagValidationError):
         await DagExecutor(engine, max_nodes=1).run(dag)
+
+
+# --- enable_tools (Phase 3: XRouter-executed tool loop) ----------------------
+
+def _tool_call(name: str, arguments: str = '{"query": "hi"}') -> dict:
+    return {"id": "call_1", "type": "function", "function": {"name": name, "arguments": arguments}}
+
+
+@pytest.mark.asyncio
+async def test_node_with_enable_tools_invokes_the_tool_and_reaches_final_response(tmp_path):
+    engine = await build_test_engine(
+        tmp_path, {"solo": {"responses": [
+            {"tool_calls": [_tool_call("web_search", '{"query": "capital of France"}')]},
+            {"content": "Paris, per the search."},
+        ]}},
+        tool_specs={"web_search": {"result": "Paris is the capital of France."}},
+    )
+    dag = DagRunRequest(nodes=[_node("a", content="what's the capital of France?", enable_tools=["web_search"])])
+    result = await DagExecutor(
+        engine, tools=engine.ctx.tools, max_tool_iterations=3,
+    ).run(dag)
+
+    assert result.status == "success"
+    assert "Paris" in result.nodes[0].response.choices[0].message["content"]
+    tool = engine.ctx.tools.get("web_search")
+    assert tool.calls == [{"query": "capital of France"}]
+
+
+@pytest.mark.asyncio
+async def test_node_without_enable_tools_never_touches_the_registry(tmp_path):
+    engine = await build_test_engine(
+        tmp_path, {"solo": {"content": "plain answer, no tools"}},
+        tool_specs={"web_search": {"result": "should not be called"}},
+    )
+    dag = DagRunRequest(nodes=[_node("a", content="hi")])
+    result = await DagExecutor(engine, tools=engine.ctx.tools).run(dag)
+
+    assert result.status == "success"
+    tool = engine.ctx.tools.get("web_search")
+    assert tool.calls == []
+
+
+@pytest.mark.asyncio
+async def test_node_requesting_an_unregistered_tool_falls_back_to_a_plain_call(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"content": "plain answer"}})
+    dag = DagRunRequest(nodes=[_node("a", content="hi", enable_tools=["web_search"])])
+    # no tools= passed at all -- DagExecutor defaults to an empty registry
+    result = await DagExecutor(engine).run(dag)
+
+    assert result.status == "success"
+    assert result.nodes[0].response.choices[0].message["content"] == "plain answer"

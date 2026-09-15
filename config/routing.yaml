@@ -11,6 +11,7 @@ routing:
   planner_routing_policy: quality  # routing policy used for the Planner's own planning call
   max_plan_retries: 2              # how many times the Planner re-prompts on an invalid/unrunnable plan
   max_verify_retries: 1            # how many times a failed Verifier check (request "verify": true) triggers a fresh plan+execute cycle
+  max_tool_iterations: 3           # call -> tool -> call round-trips a node's XRouter-executed tool use (enable_tools) may take before giving up
   # Phase 2: let the Task Classifier pick a policy per-request (task type +
   # complexity) instead of always using default_policy. A client-supplied
   # routing_policy in the request body always wins over both.

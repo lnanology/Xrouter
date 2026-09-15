@@ -7,6 +7,7 @@ from app.execution.dag import DagExecutor
 from app.intelligence.planner import (
     PLAN_TOOL_NAME,
     PlannerError,
+    _build_plan_tool_schema,
     _build_planning_request,
     _extract_tool_arguments,
     _parse_plan,
@@ -166,6 +167,99 @@ async def test_generate_plan_rejects_a_plan_exceeding_max_nodes(tmp_path):
 
     with pytest.raises(PlannerError, match="exceeding"):
         await generate_plan(engine, plan_request, max_nodes=2, max_retries=0)
+
+
+# --- enable_tools / routing_policy schema + validation (Phase 3) ------------
+
+def test_plan_tool_schema_offers_no_enable_tools_property_when_nothing_available():
+    schema = _build_plan_tool_schema([])
+    node_props = schema["function"]["parameters"]["properties"]["nodes"]["items"]["properties"]
+    assert "enable_tools" not in node_props
+
+
+def test_plan_tool_schema_enable_tools_enum_only_lists_available_tools():
+    schema = _build_plan_tool_schema(["web_search"])
+    node_props = schema["function"]["parameters"]["properties"]["nodes"]["items"]["properties"]
+    assert node_props["enable_tools"]["items"]["enum"] == ["web_search"]
+
+
+def test_plan_tool_schema_routing_policy_enum_is_always_offered():
+    schema = _build_plan_tool_schema([])
+    node_props = schema["function"]["parameters"]["properties"]["nodes"]["items"]["properties"]
+    assert "balanced" in node_props["routing_policy"]["enum"]
+
+
+def test_build_planning_request_mentions_available_tools_in_the_system_prompt():
+    req = _build_planning_request(PlanRequest(task="research something"), max_nodes=5, available_tools=["web_search"])
+    system = req.messages[0].content
+    assert "web_search" in system
+
+
+def test_build_planning_request_notes_no_tools_available():
+    req = _build_planning_request(PlanRequest(task="do X"), max_nodes=5, available_tools=[])
+    system = req.messages[0].content
+    assert "No external tools" in system
+
+
+def test_to_dag_request_carries_enable_tools_and_routing_policy_through():
+    plan = PlanSpec(nodes=[PlanNodeSpec(id="a", prompt="search something", enable_tools=["web_search"], routing_policy="quality")])
+    dag = to_dag_request(plan)
+    assert dag.nodes[0].enable_tools == ["web_search"]
+    assert dag.nodes[0].routing_policy == "quality"
+
+
+def test_validate_plan_shape_rejects_a_hallucinated_unavailable_tool():
+    plan = PlanSpec(nodes=[PlanNodeSpec(id="a", prompt="hi", enable_tools=["not_a_real_tool"])])
+    with pytest.raises(PlannerError, match="unknown/unavailable tool"):
+        _validate_plan_shape(plan, max_nodes=20, available_tools=["web_search"])
+
+
+def test_validate_plan_shape_accepts_a_tool_that_is_available():
+    plan = PlanSpec(nodes=[PlanNodeSpec(id="a", prompt="hi", enable_tools=["web_search"])])
+    _validate_plan_shape(plan, max_nodes=20, available_tools=["web_search"])  # should not raise
+
+
+def test_validate_plan_shape_rejects_any_tool_when_none_are_available():
+    plan = PlanSpec(nodes=[PlanNodeSpec(id="a", prompt="hi", enable_tools=["web_search"])])
+    with pytest.raises(PlannerError, match="unknown/unavailable tool"):
+        _validate_plan_shape(plan, max_nodes=20, available_tools=[])
+
+
+@pytest.mark.asyncio
+async def test_generate_plan_offers_only_registered_configured_tools(tmp_path):
+    plan_json = _plan_json([{"id": "a", "prompt": "search for X", "enable_tools": ["web_search"]}])
+    engine = await build_test_engine(
+        tmp_path, {"solo": {"tool_calls": [_tool_call(plan_json)]}},
+        tool_specs={"web_search": {}},
+    )
+    plan_request = PlanRequest(task="search for X", model="solo/test-model")
+
+    plan, attempts = await generate_plan(engine, plan_request, max_nodes=20, max_retries=0)
+
+    assert attempts == 1
+    assert plan.nodes[0].enable_tools == ["web_search"]
+    solo = engine.ctx.providers.get("solo")
+    sent_schema = solo.last_request.tools[0]
+    node_props = sent_schema["function"]["parameters"]["properties"]["nodes"]["items"]["properties"]
+    assert node_props["enable_tools"]["items"]["enum"] == ["web_search"]
+
+
+@pytest.mark.asyncio
+async def test_generate_plan_rejects_a_hallucinated_tool_and_retries(tmp_path):
+    bad_plan = _plan_json([{"id": "a", "prompt": "hi", "enable_tools": ["fake_tool"]}])
+    good_plan = _plan_json([{"id": "a", "prompt": "hi"}])
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"tool_calls": [_tool_call(bad_plan)]},
+        {"tool_calls": [_tool_call(good_plan)]},
+    ]}})
+    plan_request = PlanRequest(task="do something", model="solo/test-model")
+
+    plan, attempts = await generate_plan(engine, plan_request, max_nodes=20, max_retries=1)
+
+    assert attempts == 2
+    assert plan.nodes[0].enable_tools == []
+    solo = engine.ctx.providers.get("solo")
+    assert "unavailable tool" in solo.last_request.messages[-1].content.lower()
 
 
 @pytest.mark.asyncio

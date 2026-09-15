@@ -18,6 +18,7 @@ from app.routing.performance_controller import PerformanceController
 from app.routing.router import AdaptiveRouter
 from app.routing.scheduler import ConcurrencyLimiter
 from app.storage.database import Database
+from app.tools.registry import ToolRegistry
 from app.storage.repositories.metrics import MetricsRepository
 from app.storage.repositories.model import ModelRepository
 from app.storage.repositories.provider import ProviderRepository
@@ -43,3 +44,4 @@ class AppContext:
     metrics_repo: MetricsRepository
     health_monitor: HealthMonitor
     performance: PerformanceController
+    tools: ToolRegistry

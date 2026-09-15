@@ -1,0 +1,16 @@
+# Executable tools a DAG/Planner node can opt into via "enable_tools"
+# (as opposed to a plain client-supplied `tools` array, which XRouter
+# always passes through unexecuted -- the standard OpenAI contract, where
+# the *caller* is expected to run the tool). Each tool goes through the
+# same interface (app/tools/base.py) and disables itself gracefully if
+# its API key is missing, exactly like a provider in providers.yaml.
+#
+# API keys are NEVER written here -- only the *name* of the environment
+# variable that holds the key (read from .env).
+
+tools:
+  web_search:
+    enabled: true
+    api_key_env: "TAVILY_API_KEY"
+    base_url: "https://api.tavily.com"
+    timeout_seconds: 10

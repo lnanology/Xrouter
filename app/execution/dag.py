@@ -32,6 +32,8 @@ from app.contracts.dag import DagNodeRequest, DagNodeResult, DagRunRequest, DagR
 from app.contracts.request import ChatCompletionRequest
 from app.contracts.response import extract_message_text
 from app.core.errors import NoAvailableModelError, XRouterError
+from app.execution.tool_loop import DEFAULT_MAX_TOOL_ITERATIONS, run_with_tools
+from app.tools.registry import ToolRegistry
 from app.utils.ids import new_id
 
 if TYPE_CHECKING:
@@ -105,9 +107,18 @@ def _build_request(node: DagNodeRequest, outputs: dict[str, str]) -> ChatComplet
 
 
 class DagExecutor:
-    def __init__(self, engine: "ChatEngine", max_nodes: int = 20):
+    def __init__(
+        self, engine: "ChatEngine", max_nodes: int = 20,
+        tools: ToolRegistry | None = None, max_tool_iterations: int = DEFAULT_MAX_TOOL_ITERATIONS,
+    ):
         self._engine = engine
         self._max_nodes = max_nodes
+        # An empty registry (the default) makes any node's enable_tools
+        # simply resolve to nothing available -- graceful degradation,
+        # not a crash, matching every other "asked for something
+        # unconfigured" path in XRouter.
+        self._tools = tools if tools is not None else ToolRegistry()
+        self._max_tool_iterations = max_tool_iterations
 
     async def run(self, dag: DagRunRequest) -> DagRunResponse:
         start = time.time()
@@ -146,7 +157,12 @@ class DagExecutor:
         node_start = time.time()
         request = _build_request(node, outputs)
         try:
-            response = await self._engine.handle_chat(request)
+            if node.enable_tools:
+                response = await run_with_tools(
+                    self._engine, request, self._tools, node.enable_tools, max_iterations=self._max_tool_iterations,
+                )
+            else:
+                response = await self._engine.handle_chat(request)
             return DagNodeResult(id=node.id, status="success", response=response, latency_ms=round((time.time() - node_start) * 1000, 1))
         except NoAvailableModelError as e:
             return DagNodeResult(id=node.id, status="failed", error=str(e), latency_ms=round((time.time() - node_start) * 1000, 1))

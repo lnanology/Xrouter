@@ -82,3 +82,24 @@ class NoAvailableModelError(XRouterError):
     def __init__(self, message: str, *, attempts: list[dict] | None = None):
         super().__init__(message)
         self.attempts = attempts or []
+
+
+# --- Tool-execution errors (Phase 3: XRouter-executed tools, e.g. web_search) --
+# Distinct from ProviderError: these come from app/tools/*, never from a
+# provider adapter, and only ever surface inside app/execution/tool_loop.py,
+# which catches ToolError and feeds the message back to the model as the
+# tool's own result rather than failing the whole node.
+
+class ToolError(XRouterError):
+    """Base class for errors raised by an XRouter-executed tool (as
+    opposed to a client-supplied tool, which XRouter never executes on
+    the client's behalf)."""
+
+
+class ToolUnavailableError(ToolError):
+    """The tool is disabled or missing its configuration (e.g. no API
+    key) -- same graceful-degradation rule as an unconfigured provider."""
+
+
+class ToolExecutionError(ToolError):
+    """The tool ran but failed: bad arguments, an HTTP error, a timeout."""

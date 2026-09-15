@@ -20,7 +20,10 @@ def _error_body(message: str, type_: str = "xrouter_error", code: int = 400) -> 
 async def run_dag(request: Request, body: DagRunRequest):
     ctx = request.app.state.context
     engine = request.app.state.engine
-    executor = DagExecutor(engine, max_nodes=ctx.settings.routing.max_dag_nodes)
+    executor = DagExecutor(
+        engine, max_nodes=ctx.settings.routing.max_dag_nodes,
+        tools=ctx.tools, max_tool_iterations=ctx.settings.routing.max_tool_iterations,
+    )
     try:
         return await executor.run(body)
     except DagValidationError as e:

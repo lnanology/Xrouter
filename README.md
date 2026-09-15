@@ -14,10 +14,14 @@ mode that dispatches the top candidates concurrently, a confidence/
 quality-gate engine that catches degenerate responses and retries them
 with a different candidate, and a DAG executor that runs a client-supplied
 graph of chat-completion nodes with wave-based concurrency and
-`{{node_id}}` output substitution — plus the first piece of **Phase 3**
-(multi-agent orchestration groundwork): a Planner that turns a single
-free-form task into an explicit DAG (an actual LLM call, not a fixed
-template) and runs it through that same DAG executor.
+`{{node_id}}` output substitution — plus the first three pieces of
+**Phase 3** (multi-agent orchestration groundwork): a Planner that turns a
+single free-form task into an explicit DAG (an actual LLM call, not a
+fixed template) and runs it through that same DAG executor, a Verifier
+that closes the plan → execute → verify loop, and a real, config-driven
+Web Search tool (Tavily-backed) that a DAG/Planner node can invoke through
+an XRouter-executed call → tool → call loop — not a fake placeholder that
+just echoes the query back.
 
 ## Quick start
 
@@ -26,7 +30,7 @@ cd xrouter
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-cp .env.example .env   # optional: add GROQ_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY
+cp .env.example .env   # optional: add GROQ_API_KEY / OPENROUTER_API_KEY / GEMINI_API_KEY / TAVILY_API_KEY
 
 bash scripts/start.sh          # starts in background, logs -> data/xrouter.log
 bash scripts/health.sh         # or: curl http://localhost:20128/health
@@ -67,11 +71,17 @@ provider:
   unless the client passes an explicit `routing_policy` — plus
   `race_mode_enabled` / `race_candidate_count` (see Race mode below),
   `quality_gate_enabled` / `quality_gate_min_score` / `max_quality_retries`
-  (see Quality gate below), `max_dag_nodes` (see DAG Executor below), and
+  (see Quality gate below), `max_dag_nodes` (see DAG Executor below),
   `planner_routing_policy` / `max_plan_retries` / `max_verify_retries`
-  (see Planner / Verifier below).
+  (see Planner / Verifier below), and `max_tool_iterations` (see Tools
+  below).
 - `config/models.yaml` — optional score overrides per model, applied on top
   of whatever each adapter self-reports.
+- `config/tools.yaml` — which XRouter-executed tools exist (currently
+  `web_search`), their `enabled` flag, and which environment variable
+  holds their API key (`api_key_env`) — same config-driven,
+  graceful-degradation pattern as `providers.yaml`. A tool with no key
+  configured stays registered but simply never shows up as "available".
 
 Adding a brand-new *type* of provider (not just a new OpenAI-compatible
 endpoint) means writing one adapter class implementing
@@ -207,6 +217,50 @@ an empty node list, more than `routing.max_dag_nodes` nodes (default
 `20`), duplicate ids, a self-dependency, an unknown dependency, or a cycle
 all return `400` with a structured `xrouter_error` body.
 
+### Tools (XRouter-executed, e.g. Web Search)
+
+A DAG/Planner node can opt into a real, XRouter-executed tool by name via
+`"enable_tools": ["web_search"]` on that node — distinct from the plain
+`tools`/`tool_choice` fields, which XRouter always passes through
+unexecuted for the *client* to run, per the standard OpenAI contract. A
+name listed in `enable_tools` is instead executed by XRouter itself:
+`app/execution/tool_loop.py` drives the call → tool call → execute → feed
+result back → call again cycle on top of the node's normal
+`ChatEngine.handle_chat()` call, bounded by `routing.max_tool_iterations`
+(default `3`, after which whatever the model last said — tool call or
+not — is returned rather than looping forever):
+
+```bash
+curl http://localhost:20128/v1/dag/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "nodes": [
+      {"id": "research", "enable_tools": ["web_search"],
+       "messages": [{"role": "user", "content": "What is XRouter'"'"'s current stable release?"}]}
+    ]
+  }'
+```
+
+Only a name that is both *registered* (`app/tools/factory.py` has a
+builder for it) and *configured* (its API key env var is actually set) is
+ever executed; a node requesting anything else just falls back to a plain
+call, and a tool call the model makes for a name that was never enabled is
+left completely untouched in the response for the client to handle itself
+— XRouter never silently "answers" a tool call it has no executor for. A
+tool failure (bad arguments, HTTP error, timeout) is fed back to the model
+as that tool call's own result (`"Tool error: ..."`) rather than failing
+the node outright — the model can often recover by rephrasing or
+answering without it.
+
+Currently one tool ships: **`web_search`** (`app/tools/web_search.py`),
+backed by [Tavily](https://tavily.com)'s search API — set `TAVILY_API_KEY`
+in `.env` and `tools.web_search.enabled: true` in `config/tools.yaml`
+(the default) to turn it on. Adding a new tool type means writing one
+class implementing `app/tools/base.py`'s `ExecutableTool` Protocol
+(`name`, `schema`, `configured`, async `execute()`, async `close()`) and
+registering a builder in `app/tools/factory.py` — no other code needs to
+change, same pattern as adding a provider adapter.
+
 ### Planner
 
 The first piece of Phase 3 (multi-agent orchestration groundwork):
@@ -250,6 +304,22 @@ provider could even answer the planning call (nothing to report yet, same
 as a plain `/v1/chat/completions` outage); `422` if every retry still
 produced an unusable plan; `200` with the full `plan` + `dag` result
 otherwise, `plan_attempts` telling you whether it took more than one try.
+
+Each planned node can also carry two optional, richer fields the model
+fills in itself when it judges a step needs them: `routing_policy`
+overrides the routing policy for just that one step (e.g. `"quality"` for
+a final synthesis step, while the rest stay on the default), and
+`enable_tools` lets a step use a real tool (see Tools above) if it
+genuinely needs current or external information it can't answer from its
+own knowledge. The `submit_plan` schema's `enable_tools` is never a fixed
+list — it's built fresh per call from `ToolRegistry.available_names()`,
+so a plan can never even syntactically request a tool that isn't actually
+registered and configured right now; `_validate_plan_shape()` also
+double-checks this itself after the call returns, since not every
+provider strictly enforces a JSON-schema `enum` on generated tool-call
+arguments, and a plan requesting an unknown tool is rejected (and
+re-prompted, same as any other invalid plan) rather than silently running
+that step with no tool at all.
 
 #### Verifier (opt-in: `"verify": true`)
 
@@ -297,8 +367,9 @@ source .venv/bin/activate
 pytest -q
 ```
 
-160 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
-`tests/execution`, `tests/providers`, `tests/integration` — circuit
+207 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+`tests/execution`, `tests/providers`, `tests/tools`, `tests/integration` —
+circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
 cache TTL/volatility rules, router scoring/exclusion rules, fallback
 chains (timeout/429/500/mid-stream failure), provider adapters against
@@ -340,7 +411,38 @@ once with no verification call at all, `verify: true` satisfied on the
 first try skipping any re-plan, an unsatisfied-then-satisfied cycle
 actually re-planning once with the verifier's feedback provably reaching
 the second planning call's prompt, and giving up after exhausting
-`max_verify_retries` rather than looping forever).
+`max_verify_retries` rather than looping forever), the Web Search tool
+(`tests/tools/test_web_search.py` — configured/unconfigured graceful
+degradation, missing/non-string query rejection, result formatting,
+empty-results text, `max_results` clamping and invalid-value fallback, and
+non-200/timeout/connection-error handling, all against a mocked Tavily
+endpoint via `respx` — never a real network call), the tool registry
+(`tests/tools/test_registry.py` — unregistered vs. registered-but-
+unconfigured both resolving to `None`, `available_names()` filtering, and
+`close_all()` tolerating one tool's shutdown failing without blocking the
+rest) and factory (`tests/tools/test_factory.py` — empty/disabled/missing-
+API-key tools all gracefully absent rather than crashing, an unknown tool
+id in config skipped, and one tool's construction failing without taking
+the others down with it), the tool-execution loop
+(`tests/execution/test_tool_loop.py` — no-enabled-tools and
+requested-but-unregistered both falling through to a plain call, a single
+call → tool → call round-trip actually feeding the tool's result back as
+a `role: "tool"` message, multiple iterations before a final answer,
+`max_iterations` respected without erroring, a `ToolError` fed back as the
+tool's own result rather than failing the node, and a tool call for a name
+that was never enabled left completely untouched), DAG-node `enable_tools`
+end-to-end (a node with `enable_tools` actually invoking a fake tool and
+its result reaching the final response, a node without `enable_tools`
+never touching the registry at all, and a node requesting an unregistered
+tool falling back to a plain call), and the Planner's richer per-node
+schema (the `submit_plan` schema omitting `enable_tools` entirely when no
+tools are available and otherwise enum-restricting it to exactly what's
+registered and configured, the `routing_policy` enum always offered, both
+fields carried through `to_dag_request()`, `_validate_plan_shape()`
+rejecting a hallucinated/unavailable tool name, and — end-to-end through
+`build_test_engine` — a plan actually offering only the registered
+tool(s) in its schema and a plan that hallucinates an unavailable tool
+being rejected and successfully retried).
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -427,15 +529,29 @@ plan+execute cycle, up to `routing.max_verify_retries` times, via
 DagExecutor + Verifier together (`POST /v1/plan/run` is a thin HTTP
 wrapper around it). Fails open (missing/malformed tool call, or no
 provider able to answer at all counts as "satisfied") so a best-effort
-check can never hold an already-completed result hostage.
+check can never hold an already-completed result hostage. Web Search tool
++ tool-execution loop (`app/tools/` — `base.py`'s `ExecutableTool`
+Protocol, `web_search.py`'s Tavily-backed implementation, `registry.py`,
+`factory.py`; `app/execution/tool_loop.py`) — a real, config-driven tool a
+DAG/Planner node opts into via `enable_tools`, executed by XRouter itself
+in a bounded call → tool → call loop (`routing.max_tool_iterations`) on
+top of the existing `ChatEngine.handle_chat()`, never a fake placeholder
+that echoes the query back; a tool call for anything not registered and
+configured is left untouched for the client to handle. The Planner's
+`submit_plan` schema now also offers a per-node `routing_policy` override
+and a dynamically-built `enable_tools` enum that only ever lists tools the
+registry actually has available, with a defense-in-depth runtime check
+rejecting any hallucinated tool name that slipped past the JSON-schema
+`enum`.
 
 ## What's not implemented yet (by design — see Phase 3-5 in the spec)
 
-The rest of multi-agent orchestration beyond Planner + Verifier —
-dedicated Researcher/Critic roles, multi-turn agent loops, tool-using
-agents that act on a plan's own intermediate results mid-run rather than
-a single forced-JSON planning call up front — RAG/memory, plugin loader,
-browser/web-AI adapter,
+The rest of multi-agent orchestration beyond Planner + Verifier + Web
+Search — a dedicated Critic role (per-node review, distinct from the
+Verifier's end-of-run check), other tool types beyond `web_search`,
+multi-turn agent loops, tool-using agents that act on a plan's own
+intermediate results mid-run rather than a single forced-JSON planning
+call up front — RAG/memory, plugin loader, browser/web-AI adapter,
 network failover/VPN layer, PostgreSQL migration, LLM-graded (as opposed
 to structural) quality assessment, and streaming versions of race mode
 and the quality gate (both above only cover non-streaming requests — a
