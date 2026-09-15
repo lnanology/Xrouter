@@ -103,3 +103,83 @@ async def test_verify_true_gives_up_after_exhausting_retries(tmp_path):
     assert result.verification.satisfied is False
     solo = engine.ctx.providers.get("solo")
     assert solo.call_count == 6  # exactly 2 plan+execute+verify cycles, no third
+
+
+# --- plan_mutator -------------------------------------------------------------
+
+def _force_all_critique(plan):
+    return plan.model_copy(update={"nodes": [n.model_copy(update={"critique": True}) for n in plan.nodes]})
+
+
+@pytest.mark.asyncio
+async def test_plan_mutator_is_applied_to_the_generated_plan_before_execution(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"tool_calls": [_plan_tool_call([{"id": "a", "prompt": "hi"}])]},
+        {"content": "an answer"},
+        {"tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "submit_critique", "arguments": '{"satisfied": true, "feedback": ""}'},
+        }]},
+    ]}})
+    plan_request = PlanRequest(task="do something", model="solo/test-model", verify=False)
+
+    result = await run_plan_with_verification(
+        engine, plan_request, max_nodes=20, max_plan_retries=2, max_verify_retries=1, plan_mutator=_force_all_critique,
+    )
+
+    # The generated plan itself did not ask for critique -- only the
+    # mutator did -- so this proves the mutator's output, not the
+    # planner's own, is what actually got executed.
+    assert result.plan.nodes[0].critique is True
+    assert result.dag.nodes[0].critique is not None
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 3  # plan + node + the critique the mutator forced
+
+
+@pytest.mark.asyncio
+async def test_plan_mutator_defaults_to_none_and_leaves_the_plan_untouched(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"tool_calls": [_plan_tool_call([{"id": "a", "prompt": "hi"}])]},
+        {"content": "an answer"},
+    ]}})
+    plan_request = PlanRequest(task="do something", model="solo/test-model", verify=False)
+
+    result = await run_plan_with_verification(engine, plan_request, max_nodes=20, max_plan_retries=2, max_verify_retries=1)
+
+    assert result.plan.nodes[0].critique is False
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 2  # no forced critique call
+
+
+@pytest.mark.asyncio
+async def test_plan_mutator_is_applied_on_every_replan(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"tool_calls": [_plan_tool_call([{"id": "a", "prompt": "v1"}])]},          # plan 1
+        {"content": "shallow"},                                                     # node a (plan 1)
+        {"tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "submit_critique", "arguments": '{"satisfied": true, "feedback": ""}'},
+        }]},                                                                        # forced critique on node a (plan 1)
+        {"tool_calls": [_verify_tool_call(False, "needs more detail")]},           # verify 1: unsatisfied
+        {"tool_calls": [_plan_tool_call([{"id": "a2", "prompt": "v2"}])]},         # plan 2
+        {"content": "thorough"},                                                    # node a2 (plan 2)
+        {"tool_calls": [{
+            "id": "call_1", "type": "function",
+            "function": {"name": "submit_critique", "arguments": '{"satisfied": true, "feedback": ""}'},
+        }]},                                                                        # forced critique on node a2 (plan 2)
+        {"tool_calls": [_verify_tool_call(True)]},                                  # verify 2: satisfied
+    ]}})
+    plan_request = PlanRequest(task="write something good", model="solo/test-model", verify=True)
+
+    result = await run_plan_with_verification(
+        engine, plan_request, max_nodes=20, max_plan_retries=2, max_verify_retries=1, plan_mutator=_force_all_critique,
+    )
+
+    assert result.replan_count == 1
+    # Both the original plan's node and the re-planned node must have had
+    # the mutator applied -- proving it runs on every iteration of the
+    # loop, not just the first.
+    assert result.plan.nodes[0].id == "a2"
+    assert result.plan.nodes[0].critique is True
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 8

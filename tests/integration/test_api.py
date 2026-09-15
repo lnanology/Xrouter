@@ -172,3 +172,27 @@ def test_plan_run_no_providers_returns_503(client):
     )
     assert resp.status_code == 503
     assert resp.json()["detail"]["type"] == "xrouter_error"
+
+
+def test_agents_run_no_providers_returns_503(client):
+    # Same shape as test_plan_run_no_providers_returns_503: with no
+    # provider able to answer even the classifier-driven first call
+    # (solver for a trivial/simple task, or the Planner for anything
+    # harder), NoAvailableModelError propagates as a structured 503.
+    _disable_all_providers(client)
+    resp = client.post(
+        "/v1/agents/run",
+        json={"task": "agents no-providers probe, do not cache-collide"},
+    )
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["type"] == "xrouter_error"
+
+
+def test_research_no_providers_returns_503(client):
+    _disable_all_providers(client)
+    resp = client.post(
+        "/v1/research",
+        json={"query": "research no-providers probe, do not cache-collide"},
+    )
+    assert resp.status_code == 503
+    assert resp.json()["detail"]["type"] == "xrouter_error"

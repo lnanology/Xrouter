@@ -18,6 +18,7 @@ from app.routing.router import AdaptiveRouter
 from app.routing.scheduler import ConcurrencyLimiter
 from app.storage.database import Database
 from app.storage.repositories.metrics import MetricsRepository
+from app.storage.repositories.memory import MemoryRepository
 from app.storage.repositories.model import ModelRepository
 from app.storage.repositories.provider import ProviderRepository
 from app.storage.repositories.request import RequestRepository
@@ -52,6 +53,7 @@ async def startup(settings: Settings | None = None) -> AppContext:
     model_repo = ModelRepository(db)
     request_repo = RequestRepository(db)
     metrics_repo = MetricsRepository(db)
+    memory_repo = MemoryRepository(db)
 
     performance = PerformanceController(metrics_repo=metrics_repo, events=events, snapshot_interval_seconds=60.0)
     performance.start()
@@ -82,6 +84,7 @@ async def startup(settings: Settings | None = None) -> AppContext:
         router=router, limiter=limiter, cache=cache, metrics=metrics, events=events, db=db,
         provider_repo=provider_repo, model_repo=model_repo, request_repo=request_repo,
         metrics_repo=metrics_repo, health_monitor=health_monitor, performance=performance, tools=tools,
+        memory_repo=memory_repo,
     )
 
 

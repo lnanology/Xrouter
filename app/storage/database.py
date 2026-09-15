@@ -1,6 +1,12 @@
 """SQLite storage layer. All access goes through Repository classes — core
 code never writes raw SQL (section 二十六). Swapping to PostgreSQL later
-means reimplementing this module + repositories/, nothing else."""
+means reimplementing this module + repositories/, nothing else.
+
+memory_entries (Phase 3: Memory/RAG groundwork, app/storage/repositories/
+memory.py, app/retrieval/) backs XRouter's own long-term memory — distinct
+from a single request's own conversation history, and from cache_entries
+above (which is a response cache keyed by request hash, not a store of
+facts XRouter chooses to remember)."""
 from __future__ import annotations
 
 import asyncio
@@ -109,6 +115,14 @@ CREATE TABLE IF NOT EXISTS events (
     event_type TEXT NOT NULL,
     payload_json TEXT,
     recorded_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS memory_entries (
+    id TEXT PRIMARY KEY,
+    scope TEXT NOT NULL,
+    content TEXT NOT NULL,
+    tags_json TEXT NOT NULL,
+    created_at REAL NOT NULL
 );
 """
 

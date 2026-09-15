@@ -9,7 +9,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from app.api import admin, dag, health, models, openai_compatible, plan
+from app.api import admin, dag, health, models, openai_compatible, orchestrator, plan, research
 from app.core.config import get_settings
 from app.core.engine import ChatEngine
 from app.core.lifecycle import shutdown, startup
@@ -79,6 +79,8 @@ app.include_router(openai_compatible.router)
 app.include_router(admin.router)
 app.include_router(dag.router)
 app.include_router(plan.router)
+app.include_router(orchestrator.router)
+app.include_router(research.router)
 
 
 @app.get("/")

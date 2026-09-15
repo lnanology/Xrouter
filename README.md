@@ -14,17 +14,24 @@ mode that dispatches the top candidates concurrently, a confidence/
 quality-gate engine that catches degenerate responses and retries them
 with a different candidate, and a DAG executor that runs a client-supplied
 graph of chat-completion nodes with wave-based concurrency and
-`{{node_id}}` output substitution — plus four pieces of **Phase 3**
-(multi-agent orchestration groundwork): a Planner that turns a single
-free-form task into an explicit DAG (an actual LLM call, not a fixed
-template) and runs it through that same DAG executor, a Verifier that
-closes the plan → execute → verify loop, a real, config-driven Web Search
-tool (Tavily-backed) that a DAG/Planner node can invoke through an
-XRouter-executed call → tool → call loop — not a fake placeholder that
-just echoes the query back — and a Critic that reviews a single node's
-own output against its own instruction and reruns that node if
-unsatisfied, distinct from the Verifier's once-at-the-end, whole-run
-check.
+`{{node_id}}` output substitution — plus all of **Phase 3** (multi-agent
+orchestration): a Planner that turns a single free-form task into an
+explicit DAG (an actual LLM call, not a fixed template) and runs it
+through that same DAG executor, a Verifier that closes the plan → execute
+→ verify loop, a real, config-driven Web Search tool (Tavily-backed) that
+a DAG/Planner node can invoke through an XRouter-executed call → tool →
+call loop — not a fake placeholder that just echoes the query back — a
+Critic that reviews a single node's own output against its own
+instruction and reruns that node if unsatisfied, distinct from the
+Verifier's once-at-the-end whole-run check, a Dynamic Agent Team
+(`POST /v1/agents/run`) that assembles whichever of the above pieces a
+task's own complexity actually calls for (solver-only up through
+planner + specialists + critic + research + verifier + synthesizer), a
+standalone Researcher (`POST /v1/research`), and Memory/RAG — a real,
+keyword-based retrieve → augment-context → generate loop backed by a
+persistent, scope-isolated memory store, honestly scoped short of
+semantic search since XRouter has no embedding provider or vector store
+yet.
 
 ## Quick start
 
@@ -411,6 +418,118 @@ behavior, the feedback actually reaching the re-plan's prompt) is
 orchestrated by `app/execution/plan_runner.py`, independently of the
 `POST /v1/plan/run` HTTP layer.
 
+### Dynamic Agent Team (`POST /v1/agents/run`)
+
+The piece the Task Classifier's own module docstring used to flag as "not
+yet built": `app/agents/orchestrator.py` turns a single free-form task
+straight into whichever team of the pieces above the task's own
+complexity (`app/intelligence/task_classifier.py`, `0`..`4`) actually
+calls for, and returns one final answer:
+
+```bash
+curl http://localhost:20128/v1/agents/run \
+  -H "Content-Type: application/json" \
+  -d '{"task": "Design a caching strategy for a read-heavy API and justify the trade-offs"}'
+```
+
+```json
+{
+  "id": "orch_...",
+  "team": ["planner", "specialists", "critic", "verifier"],
+  "complexity": 4,
+  "task_type": "reasoning",
+  "answer": "...",
+  "dag": { "...": "set whenever the team ran more than a bare single call" },
+  "verification": { "...": "set only at tier 4" },
+  "latency_ms": 2140.7
+}
+```
+
+`team` always reflects what actually ran, never what a tier "should" have
+used. The tiers, straight from the routing table in the spec:
+
+- **0-1 (trivial/simple):** a single fast model answers directly — the
+  existing fast path, completely unchanged, zero extra calls, zero memory
+  overhead. `team: ["solver"]`.
+- **2 (medium):** one model answers, then the Critic reviews it and
+  reruns it if unsatisfied (one `DagExecutor` node, `critique: true`).
+  `team: ["solver", "critic"]`.
+- **3 (hard):** the Planner designs a multi-step DAG ("specialists");
+  every terminal node (nothing else depends on it) is forced to
+  `critique: true` deterministically, rather than trusting the Planner to
+  remember. Whenever more than one node ran, the Synthesizer composes the
+  final answer from all of them. `team` gains `"synthesizer"` only when it
+  was actually used, and `"research"` only when the plan itself used
+  `enable_tools` on some step.
+- **4 (very hard):** everything tier 3 does, plus a mandatory Verifier
+  pass (reusing `run_plan_with_verification`'s own bounded
+  re-plan-on-failure loop wholesale) and a stronger hint folded into the
+  Planner's own context that a step may genuinely need Research — never
+  forced, since forcing a tool call a task doesn't actually need would be
+  exactly the "fake placeholder functionality" the project's rules forbid.
+
+Debate (Evidence Graph / Debate / Counterfactual / Simulation / Confidence
+Engine — the real Phase 4) is deliberately **not** part of tier 4 — it
+belongs to the next phase, and a stub here would be fake by definition.
+"Coder" also isn't a separate stage: `task_type: code` already gets a
+quality-biased routing policy from the Task Classifier, which is the
+existing, real behavior this module reuses rather than duplicating.
+Response codes mirror the pieces it's built from: `503` if no provider
+could even answer (nothing to report yet), `422` if the Planner exhausted
+every retry, `503` (`OrchestrationError`) if a whole DAG's worth of steps
+all failed and there's nothing honest to synthesize or fall back to.
+
+### Researcher (`POST /v1/research`)
+
+A focused, reusable research step, reachable directly or used internally
+by the Orchestrator's higher tiers — not a new execution mechanism, it
+reuses the exact same tool-execution loop a DAG node's own `enable_tools`
+does:
+
+```bash
+curl http://localhost:20128/v1/research \
+  -H "Content-Type: application/json" \
+  -d '{"query": "What changed in the latest stable release of PostgreSQL?"}'
+```
+
+```json
+{"answer": "...", "tool_available": true}
+```
+
+`tool_available` reports whether a real search tool (e.g. `web_search`)
+was actually registered and configured for this call — not whether the
+model chose to invoke it, which is always the model's own judgment, same
+as any `enable_tools` node. Graceful degradation, not a fake answer: with
+no search tool configured, the Researcher still answers from the model's
+own knowledge, honestly — the system prompt tells the model plainly that
+no search is available, so it can say when it isn't confident — rather
+than fabricating results or refusing outright.
+
+### Memory / RAG
+
+Every Orchestrator run at tier ≥ 2 reads relevant memory before, and
+writes a summary of its own answer after. Memory is a real SQLite-backed
+table (`memory_entries`, `app/storage/repositories/memory.py`), grouped
+by an opaque `scope` string (`OrchestrationRequest.scope`, `"global"` by
+default — set it to a session/user id to keep recall from leaking across
+unrelated callers) so retrieval never wanders outside where it should.
+
+Retrieval itself (`app/retrieval/`) is a swappable `Retriever` Protocol —
+the same "everything replaceable" pattern as `Provider`/`ExecutableTool`
+— with exactly one real implementation today, `KeywordRetriever`: genuine
+substring/word-overlap search over stored memory, not a fixed template.
+This is deliberately **not** semantic search: XRouter has no embedding
+provider adapter and no vector store, and faking similarity with e.g.
+naive cosine-on-word-overlap while calling it "RAG" would be exactly the
+"fake placeholder functionality" the project's own rules forbid. Keyword
+retrieval is a real, working retrieve → augment-context → generate
+pipeline — which is what actually makes this RAG rather than nothing — it
+just isn't semantic yet. A future embeddings-backed `Retriever`, once
+XRouter has an embedding provider and a vector store, slots in behind the
+same Protocol without touching a single caller. Tiers 0-1 never touch
+memory at all, for the same "don't tax the fast path" reason they skip
+every other piece of Phase 3.
+
 ## Tests
 
 ```bash
@@ -418,9 +537,9 @@ source .venv/bin/activate
 pytest -q
 ```
 
-224 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
-`tests/execution`, `tests/providers`, `tests/tools`, `tests/integration` —
-circuit
+271 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+`tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
+`tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
 cache TTL/volatility rules, router scoring/exclusion rules, fallback
 chains (timeout/429/500/mid-stream failure), provider adapters against
@@ -511,6 +630,31 @@ a node that stays unsatisfied through every retry still reporting overall
 `"success"` since critique is a best-effort review, never a pass/fail
 gate on the node itself).
 
+Phase 3 completion coverage: `MemoryRepository`
+(`tests/storage/test_memory_repository.py` — save/recent/scoping, and
+`search()`'s word-overlap matching actually excluding a query's own
+common function words rather than false-positive-matching them as
+substrings of unrelated content), `KeywordRetriever`
+(`tests/retrieval/test_keyword.py` — wraps matching memory entries as
+`RetrievedChunk`s, respects `top_k`, empty-match and cross-scope
+isolation), the Researcher (`tests/agents/test_researcher.py` — the
+system prompt honestly reflecting tool availability, answering from the
+model's own knowledge when no search tool is configured, and actually
+driving a `web_search` tool call end-to-end when one is), the Synthesizer
+(`tests/agents/test_synthesizer.py` — composing one answer from a
+multi-node DAG's outputs and letting `NoAvailableModelError` propagate
+for its caller to handle), and the Orchestrator
+(`tests/agents/test_orchestrator.py` — `_force_terminal_critique` forcing
+critique only onto nodes nothing else depends on across single-node and
+multi-node chains, every complexity tier 0 through 4 assembling exactly
+the team it should, `OrchestrationError` at both tier 2 and tier 3/4 when
+every step fails, the `"research"`/`"synthesizer"`/`"verifier"` tags only
+ever appearing when actually used, and memory recall/write-back actually
+reaching a real `MemoryRepository`, scoped correctly). `plan_mutator`
+(`tests/execution/test_plan_runner.py`) — applied to a freshly generated
+plan before execution, left as a no-op when omitted, and reapplied on
+every re-plan, not just the first.
+
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
 real macOS + Python 3.14 run of the full suite (the "no providers
@@ -518,7 +662,7 @@ reachable" tests now explicitly disable every provider rather than relying
 on the host having none installed, and the cache fixture uses
 `asyncio.run()` instead of the now-removed implicit-event-loop fallback).
 
-## What's implemented (Phase 1 + Phase 2 + partial Phase 3)
+## What's implemented (Phase 1 + Phase 2 + Phase 3)
 
 **Phase 1:** FastAPI gateway · OpenAI-compatible `/v1/models` +
 `/v1/chat/completions` (incl. `stream=true`) · Provider adapter interface +
@@ -623,23 +767,48 @@ when `enable_tools` is also set) with the feedback folded in, up to
 `routing.max_critique_retries` times; fails open exactly like the
 Verifier, and even after exhausting every retry the node's own status
 stays `"success"` — critique is a best-effort review, never a pass/fail
-gate on whether the node ran.
+gate on whether the node ran. Dynamic Agent Team
+(`app/agents/orchestrator.py`, `app/contracts/orchestrator.py`,
+`POST /v1/agents/run`) — the piece that actually closes Phase 3: turns a
+single free-form task straight into whichever team of everything above a
+task's own complexity calls for (see the Dynamic Agent Team section
+above for the full tier table), reusing `run_plan_with_verification`'s
+own bounded re-plan loop wholesale for tier 4 rather than duplicating it,
+and a `plan_mutator` hook on that same function so the Orchestrator can
+deterministically force `critique: true` onto a plan's terminal nodes on
+every (re-)plan without forking the Planner → DAG → Verifier loop.
+Researcher (`app/agents/researcher.py`, `app/contracts/researcher.py`,
+`POST /v1/research`) — a focused research step reusing the existing tool-
+execution loop, reachable standalone or via the Orchestrator. Synthesizer
+(`app/agents/synthesizer.py`) — composes one direct final answer from a
+completed DAG's own node outputs when more than one node ran, so a
+multi-step Orchestrator run never returns a raw list of intermediate
+results. Memory/RAG (`app/storage/repositories/memory.py`,
+`app/retrieval/`) — a real, scope-isolated, SQLite-backed memory store
+and a swappable `Retriever` Protocol, with `KeywordRetriever` as the one
+real (keyword/substring, not semantic) implementation today, read before
+and written after every Orchestrator run at tier ≥ 2 — see the Memory/RAG
+section above for why keyword retrieval, not a faked-up "semantic"
+search, is what ships first.
 
-## What's not implemented yet (by design — see Phase 3-5 in the spec)
+## What's not implemented yet (by design — see Phase 4-5 in the spec)
 
-The rest of multi-agent orchestration beyond Planner + Verifier + Web
-Search + Critic — other tool types beyond `web_search`, multi-turn agent
-loops, tool-using agents that act on a plan's own intermediate results
-mid-run rather than a single forced-JSON planning call up front — RAG/
-memory, plugin loader, browser/web-AI adapter,
-network failover/VPN layer, PostgreSQL migration, LLM-graded (as opposed
-to structural) quality assessment, and streaming versions of race mode
-and the quality gate (both above only cover non-streaming requests — a
+The real Phase 4 (Evidence Graph, Debate, Counterfactual, Simulation,
+Confidence Engine) and Phase 5 (Evolution Engine, A/B Routing, Policy
+Learning, Self-healing, Automated Benchmark) haven't started. Also still
+open: other tool types beyond `web_search`, multi-turn agent loops,
+tool-using agents that act on a plan's own intermediate results mid-run
+rather than a single forced-JSON planning call up front, a real
+embeddings-backed `Retriever` (Memory/RAG is keyword-based today, by
+design — see above), plugin loader, browser/web-AI adapter, network
+failover/VPN layer, PostgreSQL migration, LLM-graded (as opposed to
+structural) quality assessment, and streaming versions of race mode and
+the quality gate (both above only cover non-streaming requests — a
 streamed response has already reached the client chunk by chunk by the
 time either could act on it). Their directories exist as reserved, empty
-packages (`app/agents`, `app/execution/cancellation.py`, `app/network`,
-`app/plugins`) so the rest of Phase 3+ has a home without restructuring
-what's already built.
+packages (`app/execution/cancellation.py`, `app/network`, `app/plugins`)
+so the rest of Phase 4+ has a home without restructuring what's already
+built.
 
 ## Project layout
 

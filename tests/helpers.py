@@ -199,6 +199,7 @@ async def build_test_engine(tmp_path, provider_specs: dict[str, dict], tool_spec
     from app.routing.scheduler import ConcurrencyLimiter
     from app.storage.database import Database
     from app.storage.repositories.metrics import MetricsRepository
+    from app.storage.repositories.memory import MemoryRepository
     from app.storage.repositories.model import ModelRepository
     from app.storage.repositories.provider import ProviderRepository
     from app.storage.repositories.request import RequestRepository
@@ -241,6 +242,7 @@ async def build_test_engine(tmp_path, provider_specs: dict[str, dict], tool_spec
         router=router, limiter=limiter, cache=cache, metrics=metrics, events=events, db=db,
         provider_repo=ProviderRepository(db), model_repo=ModelRepository(db), request_repo=RequestRepository(db),
         metrics_repo=MetricsRepository(db), health_monitor=None, performance=None, tools=tools,
+        memory_repo=MemoryRepository(db),
     )
     return ChatEngine(ctx)
 

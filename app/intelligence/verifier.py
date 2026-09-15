@@ -21,9 +21,10 @@ from typing import TYPE_CHECKING, Any
 
 from app.contracts.dag import DagRunResponse
 from app.contracts.request import ChatCompletionRequest, ChatMessage
-from app.contracts.response import ChatCompletionResponse, extract_message_text
+from app.contracts.response import ChatCompletionResponse
 from app.contracts.verifier import VerificationResult
 from app.core.errors import NoAvailableModelError
+from app.execution.dag_summary import summarize_dag
 from app.observability.logging import get_logger
 
 if TYPE_CHECKING:
@@ -55,22 +56,6 @@ _VERIFY_TOOL_SCHEMA: dict[str, Any] = {
     },
 }
 
-_MAX_NODE_OUTPUT_CHARS = 2000  # keep a single node's output from crowding out everything else in the verifier's context
-
-
-def _summarize_dag(dag: DagRunResponse) -> str:
-    lines: list[str] = []
-    for node in dag.nodes:
-        if node.status == "success" and node.response is not None:
-            text = extract_message_text(node.response).strip()
-            lines.append(f"- '{node.id}' (success): {text[:_MAX_NODE_OUTPUT_CHARS]}")
-        elif node.status == "failed":
-            lines.append(f"- '{node.id}' (failed): {node.error}")
-        else:
-            lines.append(f"- '{node.id}' (skipped): {node.error}")
-    return "\n".join(lines) or "(no nodes ran)"
-
-
 def _build_verification_request(
     task: str, context: str | None, dag: DagRunResponse, routing_policy: str | None,
 ) -> ChatCompletionRequest:
@@ -84,7 +69,7 @@ def _build_verification_request(
     parts = [f"Original task:\n{task}"]
     if context:
         parts.append(f"Context:\n{context}")
-    parts.append(f"What the plan produced:\n{_summarize_dag(dag)}")
+    parts.append(f"What the plan produced:\n{summarize_dag(dag)}")
     messages = [ChatMessage(role="system", content=system), ChatMessage(role="user", content="\n\n".join(parts))]
     return ChatCompletionRequest(
         model="auto", messages=messages, routing_policy=routing_policy,

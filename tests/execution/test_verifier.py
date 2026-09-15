@@ -4,7 +4,8 @@ import pytest
 
 from app.contracts.dag import DagNodeResult, DagRunResponse
 from app.contracts.response import ChatCompletionChoice, ChatCompletionResponse
-from app.intelligence.verifier import VERIFY_TOOL_NAME, _build_verification_request, _summarize_dag, verify
+from app.execution.dag_summary import summarize_dag
+from app.intelligence.verifier import VERIFY_TOOL_NAME, _build_verification_request, verify
 from tests.helpers import build_test_engine
 
 
@@ -31,13 +32,13 @@ def _dag_result(*, success_text: dict[str, str] | None = None, failed: dict[str,
 
 def test_summarize_dag_includes_success_output_and_failure_error():
     dag = _dag_result(success_text={"a": "Paris"}, failed={"b": "boom"})
-    summary = _summarize_dag(dag)
+    summary = summarize_dag(dag)
     assert "'a' (success): Paris" in summary
     assert "'b' (failed): boom" in summary
 
 
 def test_summarize_dag_handles_empty_dag():
-    assert _summarize_dag(DagRunResponse(id="x", status="failed", nodes=[], latency_ms=0.0)) == "(no nodes ran)"
+    assert summarize_dag(DagRunResponse(id="x", status="failed", nodes=[], latency_ms=0.0)) == "(no nodes ran)"
 
 
 def test_build_verification_request_forces_the_submit_verification_tool():

@@ -20,6 +20,7 @@ from app.routing.scheduler import ConcurrencyLimiter
 from app.storage.database import Database
 from app.tools.registry import ToolRegistry
 from app.storage.repositories.metrics import MetricsRepository
+from app.storage.repositories.memory import MemoryRepository
 from app.storage.repositories.model import ModelRepository
 from app.storage.repositories.provider import ProviderRepository
 from app.storage.repositories.request import RequestRepository
@@ -45,3 +46,4 @@ class AppContext:
     health_monitor: HealthMonitor
     performance: PerformanceController
     tools: ToolRegistry
+    memory_repo: MemoryRepository

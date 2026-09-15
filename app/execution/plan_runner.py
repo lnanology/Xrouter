@@ -10,7 +10,7 @@ test_planner.py exercise their own pieces."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable
 
 from app.contracts.dag import DagRunResponse
 from app.contracts.planner import PlanRequest, PlanSpec
@@ -21,6 +21,8 @@ from app.intelligence.verifier import verify
 
 if TYPE_CHECKING:
     from app.core.engine import ChatEngine
+
+PlanMutator = Callable[[PlanSpec], PlanSpec]
 
 
 @dataclass
@@ -42,7 +44,7 @@ def _augment_context(context: str | None, feedback: str) -> str:
 
 async def run_plan_with_verification(
     engine: "ChatEngine", plan_request: PlanRequest, max_nodes: int,
-    max_plan_retries: int, max_verify_retries: int,
+    max_plan_retries: int, max_verify_retries: int, plan_mutator: PlanMutator | None = None,
 ) -> PlanRunResult:
     """max_verify_retries only actually bounds anything when
     plan_request.verify is True -- see PlanRequest.verify's docstring for
@@ -51,7 +53,15 @@ async def run_plan_with_verification(
     into several whole plan+execute cycles. Lets NoAvailableModelError and
     PlannerError from generate_plan(), and DagValidationError from the
     executor, propagate untouched -- the API layer (app/api/plan.py)
-    turns each into the appropriate structured HTTP error."""
+    turns each into the appropriate structured HTTP error.
+
+    plan_mutator, when given, is applied to every freshly generated plan
+    (including each re-plan) right before it's converted to a DagRunRequest
+    and executed -- e.g. app/agents/orchestrator.py uses it to force
+    critique=true onto a plan's terminal nodes for its higher-complexity
+    tiers, without duplicating this whole loop just to add one
+    deterministic tweak. None (the default) leaves a generated plan
+    completely untouched, matching every existing POST /v1/plan/run call."""
     current = plan_request
     verification: VerificationResult | None = None
     replan_count = 0
@@ -59,6 +69,8 @@ async def run_plan_with_verification(
 
     while True:
         plan, plan_attempts = await generate_plan(engine, current, max_nodes, max_retries=max_plan_retries)
+        if plan_mutator is not None:
+            plan = plan_mutator(plan)
         dag_result = await DagExecutor(
             engine, max_nodes=max_nodes,
             tools=engine.ctx.tools, max_tool_iterations=engine.ctx.settings.routing.max_tool_iterations,

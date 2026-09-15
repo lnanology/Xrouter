@@ -103,3 +103,14 @@ class ToolUnavailableError(ToolError):
 
 class ToolExecutionError(ToolError):
     """The tool ran but failed: bad arguments, an HTTP error, a timeout."""
+
+
+# --- Orchestrator errors (Phase 3: Dynamic Agent Team, app/agents/orchestrator.py) --
+
+class OrchestrationError(XRouterError):
+    """The team ran (no NoAvailableModelError/PlannerError/
+    DagValidationError along the way) but every node in the resulting DAG
+    still failed, leaving nothing to synthesize into an answer -- distinct
+    from those other errors, which mean a *stage itself* couldn't run at
+    all. app/api/orchestrator.py maps this to a 503, the same "nothing
+    could even answer" contract every other XRouter entrypoint uses."""
