@@ -47,6 +47,14 @@ class RoutingConfig:
     # (only relevant when race_mode_enabled is True and the client requests
     # race=true). Clamped at use to [1, number of available candidates].
     race_candidate_count: int = 2
+    # Confidence/Quality-Gate Engine (Phase 2): off by default, same reason
+    # as race mode — a failed gate triggers an extra provider call, so it
+    # shouldn't turn on silently. When enabled, a response scoring below
+    # quality_gate_min_score gets retried with the next untried candidate,
+    # up to max_quality_retries times (non-streaming requests only).
+    quality_gate_enabled: bool = False
+    quality_gate_min_score: float = 0.5
+    max_quality_retries: int = 1
     # Phase 2: when true, an unspecified client `routing_policy` is chosen
     # by the Task Classifier (task type + complexity) instead of always
     # falling back to `default_policy`. `default_policy` is still used when
@@ -103,6 +111,9 @@ class Settings:
             max_fallback_attempts=int(routing_raw.get("max_fallback_attempts", 3)),
             race_mode_enabled=bool(routing_raw.get("race_mode_enabled", False)),
             race_candidate_count=int(routing_raw.get("race_candidate_count", 2)),
+            quality_gate_enabled=bool(routing_raw.get("quality_gate_enabled", False)),
+            quality_gate_min_score=float(routing_raw.get("quality_gate_min_score", 0.5)),
+            max_quality_retries=int(routing_raw.get("max_quality_retries", 1)),
             task_aware_policy=bool(routing_raw.get("task_aware_policy", True)),
         )
 

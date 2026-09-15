@@ -7,10 +7,12 @@ other OpenAI-compatible endpoint), with health checking, circuit breaking,
 bounded retries, quota-aware fallback, streaming, and caching.
 
 This is **Phase 1** (fast, stable, low-cost, recoverable — no agents, no
-Kubernetes/Kafka/Redis, no quota/CAPTCHA/IP bypass of any kind) plus three
+Kubernetes/Kafka/Redis, no quota/CAPTCHA/IP bypass of any kind) plus four
 pieces of **Phase 2**: a request-level task classifier, a telemetry-driven
-performance controller that auto-tunes routing weights, and an opt-in race
-mode that dispatches the top candidates concurrently.
+performance controller that auto-tunes routing weights, an opt-in race
+mode that dispatches the top candidates concurrently, and a confidence/
+quality-gate engine that catches degenerate responses and retries them
+with a different candidate.
 
 ## Quick start
 
@@ -57,8 +59,10 @@ provider:
   `task_aware_policy` (default `true`) — when on, each request is
   classified (chat/code/research/reasoning/creative/tool_use +
   complexity) and routed under the policy that classification suggests,
-  unless the client passes an explicit `routing_policy` — and
-  `race_mode_enabled` / `race_candidate_count` (see Race mode below).
+  unless the client passes an explicit `routing_policy` — plus
+  `race_mode_enabled` / `race_candidate_count` (see Race mode below) and
+  `quality_gate_enabled` / `quality_gate_min_score` / `max_quality_retries`
+  (see Quality gate below).
 - `config/models.yaml` — optional score overrides per model, applied on top
   of whatever each adapter self-reports.
 
@@ -133,6 +137,32 @@ remaining candidates one at a time, same as the non-race path. Race mode
 only applies to non-streaming requests in this phase — `stream: true`
 silently ignores the `race` flag (see `app/execution/race.py` for why).
 
+### Quality gate
+
+Also off by default (`routing.quality_gate_enabled: false`) — a failed
+gate costs an extra provider call, so it doesn't turn on silently either.
+When enabled, every non-streaming response is scored by
+`app/intelligence/quality_gate.py`: an empty reply, output the provider
+itself cut short (`finish_reason: "length"`), a small local model stuck
+repeating one word or character, or (when the request forced a specific
+tool via `tool_choice`) a response with no tool call at all. None of this
+is a judgment of whether the *content* is factually right — that would
+need paying for a second model call to grade the first, which XRouter
+doesn't do by default. A response scoring below `quality_gate_min_score`
+(default `0.5`) gets retried with the next untried candidate from the same
+routing decision, up to `max_quality_retries` times (default `1`); if
+every candidate is exhausted, XRouter returns the best response it found
+rather than erroring — the assessment is always attached so you can see
+what happened:
+
+```json
+"xrouter": {
+  "provider": "ollama", "model": "qwen3:latest", "...": "...",
+  "quality": {"score": 1.0, "passed": true, "reasons": []},
+  "quality_retries": 1
+}
+```
+
 ## Tests
 
 ```bash
@@ -140,7 +170,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-94 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+110 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
 cache TTL/volatility rules, router scoring/exclusion rules, fallback
@@ -150,10 +180,14 @@ integration tests (including the "no provider reachable" degraded-but-alive
 path and graceful shutdown), the task classifier (task-type detection,
 complexity scoring, suggested policy, tool-use override), the performance
 controller (neutral below `MIN_SAMPLES`, EMA latency/success weighting,
-graceful start/stop of its background snapshot loop), and race mode
+graceful start/stop of its background snapshot loop), race mode
 (fastest-candidate-wins, loser cancellation, all-raced-failed fallback,
 `race.started`/`race.completed` events, candidate-count clamping, and the
-server-switch/per-request-opt-in/no-streaming gating logic).
+server-switch/per-request-opt-in/no-streaming gating logic), and the
+quality gate (empty/truncated/degenerate-repetition/missing-forced-
+tool-call detection, retry-to-next-untried-candidate, best-effort return
+when every candidate still fails, `quality.failed` events, and the
+`max_quality_retries: 0` no-retry-but-still-assess case).
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -197,16 +231,23 @@ for non-streaming chat completions, returning whichever answers first and
 cancelling the rest; reuses the exact same breaker/quota/retry/performance
 bookkeeping as the sequential fallback chain via a shared
 `try_candidate()` helper, and falls back to the remaining candidates
-sequentially if every raced one fails.
+sequentially if every raced one fails. Confidence/Quality-Gate Engine
+(`app/intelligence/quality_gate.py`) — opt-in (`routing.quality_gate_enabled`)
+deterministic scoring of a non-streaming response (empty, truncated,
+degenerate word/character repetition, missing forced tool call) that
+retries a below-threshold response with the next untried candidate, up to
+`max_quality_retries` times, always attaching the assessment to
+`xrouter.quality` and never erroring out even if nothing better is found.
 
 ## What's not implemented yet (by design — see Phase 2-5 in the spec)
 
 Task-complexity-driven multi-agent orchestration (Planner/Researcher/
-Critic/Verifier), DAG executor, confidence/quality-gate engine, RAG/memory,
-plugin loader, browser/web-AI adapter, network failover/VPN layer,
-PostgreSQL migration, and streaming race mode (race mode above only covers
-non-streaming requests — racing partial token streams needs its own
-buffering/cancellation design). Their directories exist as reserved, empty
+Critic/Verifier), DAG executor, RAG/memory, plugin loader, browser/web-AI
+adapter, network failover/VPN layer, PostgreSQL migration, LLM-graded (as
+opposed to structural) quality assessment, and streaming versions of race
+mode and the quality gate (both above only cover non-streaming requests —
+a streamed response has already reached the client chunk by chunk by the
+time either could act on it). Their directories exist as reserved, empty
 packages (`app/agents`, `app/execution/{dag,cancellation}.py`,
 `app/network`, `app/plugins`) so the rest of Phase 2+ has a home without
 restructuring what's already built.

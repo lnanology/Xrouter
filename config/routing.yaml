@@ -4,6 +4,9 @@ routing:
   race_mode_enabled: false   # optional; off by default to avoid burning free-tier quota
   race_candidate_count: 2    # how many top candidates to race concurrently when race_mode_enabled
                               # is true and a request sets "race": true (non-streaming only)
+  quality_gate_enabled: false   # optional; off by default, a failed gate costs an extra provider call
+  quality_gate_min_score: 0.5   # response.xrouter.quality.score below this fails the gate
+  max_quality_retries: 1        # how many untried candidates to retry through on a failed gate
   # Phase 2: let the Task Classifier pick a policy per-request (task type +
   # complexity) instead of always using default_policy. A client-supplied
   # routing_policy in the request body always wins over both.

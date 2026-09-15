@@ -10,9 +10,11 @@ from collections.abc import AsyncIterator
 
 from app.contracts.request import ChatCompletionRequest
 from app.contracts.response import ChatCompletionChunk, ChatCompletionResponse
+from app.contracts.router import RoutingDecision
 from app.core.context import AppContext
 from app.core.errors import NoAvailableModelError
 from app.execution.race import run_race
+from app.intelligence.quality_gate import assess as assess_quality
 from app.intelligence.task_classifier import TaskClassification, classify
 from app.observability.logging import get_logger
 from app.routing.fallback import run_chat, run_stream_chat
@@ -41,6 +43,45 @@ class ChatEngine:
         and an explicit per-request opt-in, and only ever applies to
         non-streaming requests — see app/execution/race.py for why."""
         return bool(self.ctx.settings.routing.race_mode_enabled and request.race and not request.stream)
+
+    async def _apply_quality_gate(
+        self, decision: RoutingDecision, request: ChatCompletionRequest,
+        response: ChatCompletionResponse, attempts: list[dict],
+    ) -> tuple[ChatCompletionResponse, list[dict]]:
+        """Non-streaming only — see app/intelligence/quality_gate.py. Never
+        raises: if every untried candidate is exhausted (or also fails the
+        gate) it returns the best response found so far, with the final
+        assessment attached to xrouter.quality either way."""
+        min_score = self.ctx.settings.routing.quality_gate_min_score
+        max_retries = self.ctx.settings.routing.max_quality_retries
+        all_candidates = [decision.primary, *decision.fallback_chain]
+
+        retries = 0
+        assessment = assess_quality(response, request, min_score=min_score)
+        while not assessment.passed and retries < max_retries:
+            self.ctx.events.emit("quality.failed", {"reasons": assessment.reasons, "score": assessment.score})
+            tried = {(a["provider_id"], a.get("model_id")) for a in attempts if a["status"] != "skipped"}
+            remaining = [c for c in all_candidates if (c.provider_id, c.model_id) not in tried]
+            if not remaining:
+                break
+            retry_decision = RoutingDecision(primary=remaining[0], fallback_chain=remaining[1:], policy=decision.policy)
+            try:
+                new_response, new_attempts = await run_chat(
+                    retry_decision, self.ctx.providers, self.ctx.circuits, self.ctx.quota, self.ctx.limiter,
+                    request, len(remaining), performance=self.ctx.performance,
+                )
+            except NoAvailableModelError:
+                break
+            response = new_response
+            attempts = attempts + new_attempts
+            retries += 1
+            assessment = assess_quality(response, request, min_score=min_score)
+
+        response.xrouter = response.xrouter or {}
+        response.xrouter["quality"] = {"score": assessment.score, "passed": assessment.passed, "reasons": assessment.reasons}
+        if retries:
+            response.xrouter["quality_retries"] = retries
+        return response, attempts
 
     async def handle_chat(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         request_id = new_id("req")
@@ -111,6 +152,9 @@ class ChatEngine:
                     request_id, i, a["provider_id"], a["model_id"], a["status"], a.get("latency_ms"), a.get("error")
                 )
             raise
+
+        if self.ctx.settings.routing.quality_gate_enabled:
+            response, attempts = await self._apply_quality_gate(decision, request, response, attempts)
 
         latency_ms = (time.time() - start) * 1000
         record.status = "success"

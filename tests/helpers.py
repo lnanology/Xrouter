@@ -23,12 +23,15 @@ class FakeProvider(Provider):
     def __init__(
         self, config: ProviderConfig, models: list[ModelInfo], behavior="success",
         fail_after_chunks: int | None = None, delay_seconds: float = 0.0,
+        content: str = "ok", finish_reason: str = "stop",
     ):
         super().__init__(config)
         self._models = models
         self.behavior = behavior
         self.fail_after_chunks = fail_after_chunks
         self.delay_seconds = delay_seconds
+        self.content = content
+        self.finish_reason = finish_reason
         self.call_count = 0
         self.cancelled = False
 
@@ -73,7 +76,7 @@ class FakeProvider(Provider):
         self._maybe_raise()
         return ChatCompletionResponse(
             model=f"{self.id}/{model}",
-            choices=[ChatCompletionChoice(index=0, message={"role": "assistant", "content": "ok"}, finish_reason="stop")],
+            choices=[ChatCompletionChoice(index=0, message={"role": "assistant", "content": self.content}, finish_reason=self.finish_reason)],
             usage=Usage(prompt_tokens=5, completion_tokens=5, total_tokens=10),
         )
 
