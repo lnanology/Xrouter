@@ -68,7 +68,8 @@ provider:
   `race_mode_enabled` / `race_candidate_count` (see Race mode below),
   `quality_gate_enabled` / `quality_gate_min_score` / `max_quality_retries`
   (see Quality gate below), `max_dag_nodes` (see DAG Executor below), and
-  `planner_routing_policy` / `max_plan_retries` (see Planner below).
+  `planner_routing_policy` / `max_plan_retries` / `max_verify_retries`
+  (see Planner / Verifier below).
 - `config/models.yaml` — optional score overrides per model, applied on top
   of whatever each adapter self-reports.
 
@@ -250,6 +251,45 @@ as a plain `/v1/chat/completions` outage); `422` if every retry still
 produced an unusable plan; `200` with the full `plan` + `dag` result
 otherwise, `plan_attempts` telling you whether it took more than one try.
 
+#### Verifier (opt-in: `"verify": true`)
+
+Closes the loop: pass `"verify": true` and, once the DAG finishes,
+XRouter asks a Verifier — another actual LLM call (forced
+`submit_verification` tool call), not a heuristic — whether the run
+*genuinely* accomplished the original task. If not, the Verifier's own
+feedback gets folded into the task's context and the whole plan+execute
+cycle runs again, up to `routing.max_verify_retries` times (default `1`):
+
+```bash
+curl http://localhost:20128/v1/plan/run \
+  -H "Content-Type: application/json" \
+  -d '{"task": "Draft a 3-bullet summary of the attached notes", "verify": true}'
+```
+
+```json
+{
+  "id": "plan_...",
+  "plan": {"...": "the *winning* plan -- the last one generated"},
+  "plan_attempts": 1,
+  "dag": {"...": "the winning plan's DagRunResponse"},
+  "verification": {"satisfied": true, "feedback": null},
+  "replan_count": 1,
+  "latency_ms": 1730.4
+}
+```
+
+Off by default, same reasoning as race mode/the quality gate: a failed
+verification costs an entire extra plan+execute cycle to retry, not just
+one call, so it shouldn't turn on silently. The Verifier **fails open** —
+if its own tool call is missing, malformed, or unanswerable, that counts
+as "satisfied" rather than blocking the response or looping forever; a
+best-effort second opinion should never hold a result hostage. This is
+the full extent of Phase 3's first loop: Planner → DAG executor →
+Verifier → (maybe) re-plan. Everything (the loop itself, the fail-open
+behavior, the feedback actually reaching the re-plan's prompt) is
+orchestrated by `app/execution/plan_runner.py`, independently of the
+`POST /v1/plan/run` HTTP layer.
+
 ## Tests
 
 ```bash
@@ -257,7 +297,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-148 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+160 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
 cache TTL/volatility rules, router scoring/exclusion rules, fallback
@@ -292,7 +332,15 @@ error-message-fed retry loop actually recovering from an invalid
 response with no tool call at all, rejecting a plan over the node cap,
 and a generated plan actually executing end-to-end with its
 planner-authored `{{node_id}}` dependency wiring reaching the provider
-call).
+call), and the Verifier + plan-runner loop (DAG-result summarization,
+forced-tool-call request building, fail-open behavior on a missing tool
+call / malformed arguments / no provider available, and — end-to-end
+through `app/execution/plan_runner.py` — `verify: false` running exactly
+once with no verification call at all, `verify: true` satisfied on the
+first try skipping any re-plan, an unsatisfied-then-satisfied cycle
+actually re-planning once with the verifier's feedback provably reaching
+the second planning call's prompt, and giving up after exhausting
+`max_verify_retries` rather than looping forever).
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -368,14 +416,26 @@ doesn't form a runnable graph. The resulting plan runs through the exact
 same `DagExecutor` a client-supplied DAG uses — the Planner never talks to
 a provider itself outside its one planning call, so every node it
 produces gets the identical caching/routing/circuit-breaking/race/
-quality-gate behavior any other XRouter request gets.
+quality-gate behavior any other XRouter request gets. Verifier
+(`app/intelligence/verifier.py`, `app/contracts/verifier.py`) — opt-in
+(request `"verify": true`) second-opinion check, also a forced tool call
+(`submit_verification`) rather than a heuristic, over what a completed DAG
+run actually produced versus the original task; a `false` verdict feeds
+its own feedback back into the task's context and triggers a fresh
+plan+execute cycle, up to `routing.max_verify_retries` times, via
+`app/execution/plan_runner.py` — the module that wires Planner +
+DagExecutor + Verifier together (`POST /v1/plan/run` is a thin HTTP
+wrapper around it). Fails open (missing/malformed tool call, or no
+provider able to answer at all counts as "satisfied") so a best-effort
+check can never hold an already-completed result hostage.
 
 ## What's not implemented yet (by design — see Phase 3-5 in the spec)
 
-The rest of multi-agent orchestration beyond the Planner — Researcher/
-Critic/Verifier roles, multi-turn agent loops, tool-using agents that act
-on a plan's own intermediate results rather than a single forced-JSON
-planning call — RAG/memory, plugin loader, browser/web-AI adapter,
+The rest of multi-agent orchestration beyond Planner + Verifier —
+dedicated Researcher/Critic roles, multi-turn agent loops, tool-using
+agents that act on a plan's own intermediate results mid-run rather than
+a single forced-JSON planning call up front — RAG/memory, plugin loader,
+browser/web-AI adapter,
 network failover/VPN layer, PostgreSQL migration, LLM-graded (as opposed
 to structural) quality assessment, and streaming versions of race mode
 and the quality gate (both above only cover non-streaming requests — a

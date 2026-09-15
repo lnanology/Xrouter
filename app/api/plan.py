@@ -1,7 +1,11 @@
 """POST /v1/plan/run -- Planner (Phase 3 groundwork): turns a single
-free-form task into an explicit DAG (app/intelligence/planner.py) and then
-runs it through the exact same DagExecutor a client-supplied DAG uses
-(see app/api/dag.py, app/execution/dag.py)."""
+free-form task into an explicit DAG (app/intelligence/planner.py), runs
+it through the exact same DagExecutor a client-supplied DAG uses, and
+optionally (PlanRequest.verify) closes the loop with the Verifier
+(app/intelligence/verifier.py), re-planning with its feedback if the run
+didn't actually accomplish the task. All the orchestration logic lives in
+app/execution/plan_runner.py; this module only translates that into
+HTTP."""
 from __future__ import annotations
 
 import time
@@ -10,8 +14,9 @@ from fastapi import APIRouter, HTTPException, Request
 
 from app.contracts.planner import PlanRequest, PlanRunResponse
 from app.core.errors import NoAvailableModelError
-from app.execution.dag import DagExecutor, DagValidationError
-from app.intelligence.planner import PlannerError, generate_plan, to_dag_request
+from app.execution.dag import DagValidationError
+from app.execution.plan_runner import run_plan_with_verification
+from app.intelligence.planner import PlannerError
 from app.observability.logging import get_logger
 from app.utils.ids import new_id
 
@@ -33,8 +38,10 @@ async def run_plan(request: Request, body: PlanRequest):
 
     start = time.time()
     try:
-        plan, attempts = await generate_plan(
-            engine, body, max_nodes, max_retries=ctx.settings.routing.max_plan_retries,
+        result = await run_plan_with_verification(
+            engine, body, max_nodes,
+            max_plan_retries=ctx.settings.routing.max_plan_retries,
+            max_verify_retries=ctx.settings.routing.max_verify_retries,
         )
     except NoAvailableModelError as e:
         # Nothing could even answer the planning call -- same "structured
@@ -45,11 +52,6 @@ async def run_plan(request: Request, body: PlanRequest):
         # retries -- a client-side-fixable situation (rephrase the task,
         # raise max_nodes, ...), not a server outage.
         raise HTTPException(status_code=422, detail=_error_body(str(e), code=422)) from e
-
-    dag_request = to_dag_request(plan)
-    executor = DagExecutor(engine, max_nodes=max_nodes)
-    try:
-        dag_result = await executor.run(dag_request)
     except DagValidationError as e:
         # Should be unreachable: generate_plan() already validated the
         # exact same graph with app.execution.dag's own validator before
@@ -62,6 +64,7 @@ async def run_plan(request: Request, body: PlanRequest):
         ) from e
 
     return PlanRunResponse(
-        id=new_id("plan"), plan=plan, plan_attempts=attempts, dag=dag_result,
+        id=new_id("plan"), plan=result.plan, plan_attempts=result.plan_attempts, dag=result.dag,
+        verification=result.verification, replan_count=result.replan_count,
         latency_ms=round((time.time() - start) * 1000, 1),
     )

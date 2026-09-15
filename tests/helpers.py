@@ -44,6 +44,11 @@ class FakeProvider(Provider):
         self.call_count = 0
         self.cancelled = False
         self.last_request: ChatCompletionRequest | None = None
+        # Every request this provider ever received, in order -- lets a
+        # test inspect an *intermediate* call (e.g. the second of several
+        # sequential calls in a retry/replan loop), which last_request
+        # alone can't do once later calls have overwritten it.
+        self.request_log: list[ChatCompletionRequest] = []
 
     def capabilities(self) -> set[ProviderCapability]:
         return {ProviderCapability.CHAT, ProviderCapability.STREAMING}
@@ -78,6 +83,7 @@ class FakeProvider(Provider):
 
     async def chat(self, model: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
         self.last_request = request
+        self.request_log.append(request)
         if self.delay_seconds:
             try:
                 await asyncio.sleep(self.delay_seconds)
