@@ -1,0 +1,14 @@
+2026-09-14T23:30:48+0800 WARNING xrouter.config No XROUTER_ADMIN_TOKEN configured — generated a random admin token for this run: HiOSxaLVkuRcqJV7c8j8neyhDxt4qIK8 (set XROUTER_ADMIN_TOKEN in .env to persist it across restarts)
+INFO:     Started server process [32929]
+INFO:     Waiting for application startup.
+2026-09-14T23:30:48+0800 INFO xrouter.performance_controller performance controller started (interval=60s, min_samples=10)
+2026-09-14T23:30:48+0800 INFO xrouter.health health monitor started (interval=20s)
+2026-09-14T23:30:48+0800 INFO xrouter.lifecycle startup complete: 4 provider(s) configured, 1 enabled, 1 model(s) discovered
+INFO:     Application startup complete.
+ERROR:    [Errno 48] error while attempting to bind on address ('0.0.0.0', 20128): address already in use
+INFO:     Waiting for application shutdown.
+2026-09-14T23:30:48+0800 INFO xrouter.lifecycle shutdown starting
+2026-09-14T23:30:48+0800 INFO xrouter.health health monitor stopped
+2026-09-14T23:30:48+0800 INFO xrouter.performance_controller performance controller stopped
+2026-09-14T23:30:48+0800 INFO xrouter.lifecycle shutdown complete
+INFO:     Application shutdown complete.
