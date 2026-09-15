@@ -140,8 +140,18 @@ def test_dag_run_well_formed_but_no_providers_returns_200_with_failed_node(clien
     # inside the body since a run can be partially successful. Explicitly
     # disable every provider rather than relying on the host having none
     # reachable (a dev's real Mac may have Ollama installed and running).
+    # The prompt text must also be unique: the response cache is keyed on
+    # model+messages and backed by the real on-disk data/xrouter.sqlite3,
+    # so a plain "hi"/"auto" request -- also used by
+    # test_admin_metrics_reflects_recorded_requests above, which runs with
+    # providers enabled -- can still be served from a same-session cache
+    # hit even with every provider disabled, since the cache is checked
+    # before providers are.
     _disable_all_providers(client)
-    resp = client.post("/v1/dag/run", json={"nodes": [{"id": "a", "messages": [{"role": "user", "content": "hi"}]}]})
+    resp = client.post(
+        "/v1/dag/run",
+        json={"nodes": [{"id": "a", "messages": [{"role": "user", "content": "dag no-providers probe, do not cache-collide"}]}]},
+    )
     assert resp.status_code == 200
     body = resp.json()
     assert body["status"] == "failed"
