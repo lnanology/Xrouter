@@ -43,3 +43,17 @@ class ChatCompletionChunk(BaseModel):
     created: int = Field(default_factory=lambda: int(time.time()))
     model: str
     choices: list[ChatCompletionChunkChoice]
+
+
+def extract_message_text(response: ChatCompletionResponse) -> str:
+    """Pulls the plain-text content out of a response's first choice, or
+    "" if there isn't any (e.g. a tool-call-only response). Shared by
+    anything that needs to *read* a completed response's answer rather
+    than just relay it — the quality gate (app/intelligence/quality_gate.py)
+    and the DAG executor's {{node_id}} output substitution
+    (app/execution/dag.py) both use this instead of each re-implementing
+    the same "choices[0].message.get('content')" reach-in."""
+    if not response.choices:
+        return ""
+    content = response.choices[0].message.get("content")
+    return content if isinstance(content, str) else ""

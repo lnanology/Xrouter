@@ -7,12 +7,14 @@ other OpenAI-compatible endpoint), with health checking, circuit breaking,
 bounded retries, quota-aware fallback, streaming, and caching.
 
 This is **Phase 1** (fast, stable, low-cost, recoverable — no agents, no
-Kubernetes/Kafka/Redis, no quota/CAPTCHA/IP bypass of any kind) plus four
+Kubernetes/Kafka/Redis, no quota/CAPTCHA/IP bypass of any kind) plus five
 pieces of **Phase 2**: a request-level task classifier, a telemetry-driven
 performance controller that auto-tunes routing weights, an opt-in race
-mode that dispatches the top candidates concurrently, and a confidence/
+mode that dispatches the top candidates concurrently, a confidence/
 quality-gate engine that catches degenerate responses and retries them
-with a different candidate.
+with a different candidate, and a DAG executor that runs a client-supplied
+graph of chat-completion nodes with wave-based concurrency and
+`{{node_id}}` output substitution.
 
 ## Quick start
 
@@ -60,9 +62,9 @@ provider:
   classified (chat/code/research/reasoning/creative/tool_use +
   complexity) and routed under the policy that classification suggests,
   unless the client passes an explicit `routing_policy` — plus
-  `race_mode_enabled` / `race_candidate_count` (see Race mode below) and
+  `race_mode_enabled` / `race_candidate_count` (see Race mode below),
   `quality_gate_enabled` / `quality_gate_min_score` / `max_quality_retries`
-  (see Quality gate below).
+  (see Quality gate below), and `max_dag_nodes` (see DAG Executor below).
 - `config/models.yaml` — optional score overrides per model, applied on top
   of whatever each adapter self-reports.
 
@@ -163,6 +165,41 @@ what happened:
 }
 ```
 
+### DAG Executor
+
+Runs a client-supplied *explicit* graph of chat-completion nodes — not an
+auto-generated plan; that's future Phase 3+ multi-agent territory. Each
+node is a normal chat-completion request plus an `id` and an optional
+`depends_on` list; a node's message content can reference an upstream
+node's output with `{{node_id}}`, substituted with that node's extracted
+response text before the node runs:
+
+```bash
+curl http://localhost:20128/v1/dag/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "nodes": [
+      {"id": "capital", "messages": [{"role": "user", "content": "What is the capital of France?"}]},
+      {"id": "translate", "depends_on": ["capital"],
+       "messages": [{"role": "user", "content": "Translate {{capital}} to Spanish"}]}
+    ]
+  }'
+```
+
+Nodes are layered into concurrent "waves" by topological order (Kahn's
+algorithm) — independent nodes in the same wave run concurrently via
+`asyncio.gather`, and every node runs through the real `ChatEngine`, so it
+gets the exact same caching/routing/circuit-breaking/race/quality-gate
+behavior as `/v1/chat/completions`. If a node fails, everything that
+transitively depends on it is marked `"skipped"` without running, while
+unrelated nodes still execute normally; the overall run is reported as
+`"success"` (all nodes succeeded), `"partial"` (a mix), or `"failed"`
+(none succeeded) — always `200 OK`, since a partially-successful DAG isn't
+a server error. The request itself is validated before anything executes:
+an empty node list, more than `routing.max_dag_nodes` nodes (default
+`20`), duplicate ids, a self-dependency, an unknown dependency, or a cycle
+all return `400` with a structured `xrouter_error` body.
+
 ## Tests
 
 ```bash
@@ -170,7 +207,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-110 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+129 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
 cache TTL/volatility rules, router scoring/exclusion rules, fallback
@@ -183,11 +220,20 @@ controller (neutral below `MIN_SAMPLES`, EMA latency/success weighting,
 graceful start/stop of its background snapshot loop), race mode
 (fastest-candidate-wins, loser cancellation, all-raced-failed fallback,
 `race.started`/`race.completed` events, candidate-count clamping, and the
-server-switch/per-request-opt-in/no-streaming gating logic), and the
+server-switch/per-request-opt-in/no-streaming gating logic), the
 quality gate (empty/truncated/degenerate-repetition/missing-forced-
 tool-call detection, retry-to-next-untried-candidate, best-effort return
 when every candidate still fails, `quality.failed` events, and the
-`max_quality_retries: 0` no-retry-but-still-assess case).
+`max_quality_retries: 0` no-retry-but-still-assess case), and the DAG
+executor (wave/topological ordering, validation errors for empty/
+too-many/duplicate/self-dependent/unknown-dependency/cyclic graphs,
+placeholder substitution incl. unknown-placeholder passthrough and
+repeated placeholders, and — end-to-end through a real `ChatEngine` with
+fake providers via the new `tests/helpers.py:build_test_engine` harness —
+linear-chain substitution actually reaching the provider call, parallel
+fan-in combining two upstream outputs, cascading skip-on-failure that
+leaves sibling nodes unaffected, and the `max_dag_nodes` cap enforced
+end-to-end).
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -238,19 +284,32 @@ degenerate word/character repetition, missing forced tool call) that
 retries a below-threshold response with the next untried candidate, up to
 `max_quality_retries` times, always attaching the assessment to
 `xrouter.quality` and never erroring out even if nothing better is found.
+DAG Executor (`app/execution/dag.py`, `app/contracts/dag.py`,
+`POST /v1/dag/run`) — executes a client-supplied explicit graph of chat-
+completion nodes in topologically-ordered concurrent waves (Kahn's
+algorithm), substituting `{{node_id}}` placeholders with upstream node
+output before each node runs; every node goes through the real
+`ChatEngine.handle_chat()`, so it gets the same caching/routing/circuit-
+breaking/race/quality-gate behavior as the plain chat endpoint. A failing
+node cascades a `"skipped"` status to everything depending on it (directly
+or transitively) without affecting unrelated nodes; the run reports
+`"success"` / `"partial"` / `"failed"` overall. Full validation (node
+count, duplicate/self/unknown dependencies, cycles) happens before any
+node executes.
 
 ## What's not implemented yet (by design — see Phase 2-5 in the spec)
 
 Task-complexity-driven multi-agent orchestration (Planner/Researcher/
-Critic/Verifier), DAG executor, RAG/memory, plugin loader, browser/web-AI
-adapter, network failover/VPN layer, PostgreSQL migration, LLM-graded (as
-opposed to structural) quality assessment, and streaming versions of race
-mode and the quality gate (both above only cover non-streaming requests —
-a streamed response has already reached the client chunk by chunk by the
-time either could act on it). Their directories exist as reserved, empty
-packages (`app/agents`, `app/execution/{dag,cancellation}.py`,
-`app/network`, `app/plugins`) so the rest of Phase 2+ has a home without
-restructuring what's already built.
+Critic/Verifier) that plans a DAG automatically (the DAG *executor* above
+only runs a graph the client already supplies), RAG/memory, plugin loader,
+browser/web-AI adapter, network failover/VPN layer, PostgreSQL migration,
+LLM-graded (as opposed to structural) quality assessment, and streaming
+versions of race mode and the quality gate (both above only cover
+non-streaming requests — a streamed response has already reached the
+client chunk by chunk by the time either could act on it). Their
+directories exist as reserved, empty packages (`app/agents`,
+`app/execution/cancellation.py`, `app/network`, `app/plugins`) so the rest
+of Phase 2+ has a home without restructuring what's already built.
 
 ## Project layout
 

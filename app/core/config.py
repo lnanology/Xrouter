@@ -55,6 +55,10 @@ class RoutingConfig:
     quality_gate_enabled: bool = False
     quality_gate_min_score: float = 0.5
     max_quality_retries: int = 1
+    # DAG Executor (Phase 2): caps how many nodes a single client-submitted
+    # DAG may contain, so one request can't fan out into an unbounded
+    # number of provider calls.
+    max_dag_nodes: int = 20
     # Phase 2: when true, an unspecified client `routing_policy` is chosen
     # by the Task Classifier (task type + complexity) instead of always
     # falling back to `default_policy`. `default_policy` is still used when
@@ -114,6 +118,7 @@ class Settings:
             quality_gate_enabled=bool(routing_raw.get("quality_gate_enabled", False)),
             quality_gate_min_score=float(routing_raw.get("quality_gate_min_score", 0.5)),
             max_quality_retries=int(routing_raw.get("max_quality_retries", 1)),
+            max_dag_nodes=int(routing_raw.get("max_dag_nodes", 20)),
             task_aware_policy=bool(routing_raw.get("task_aware_policy", True)),
         )
 

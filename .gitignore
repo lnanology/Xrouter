@@ -5,8 +5,8 @@ venv/
 .env
 data/*.sqlite3
 data/*.sqlite3-journal
+data/*.log
+data/*.pid
 .pytest_cache/
 *.egg-info/
 .DS_Store
-data/*.log
-data/*.pid

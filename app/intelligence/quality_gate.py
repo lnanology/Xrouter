@@ -26,7 +26,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 
 from app.contracts.request import ChatCompletionRequest
-from app.contracts.response import ChatCompletionResponse
+from app.contracts.response import ChatCompletionResponse, extract_message_text
 
 MIN_CONTENT_CHARS = 2
 REPETITION_WORD_MIN_COUNT = 6              # don't judge very short replies for word repetition
@@ -40,13 +40,6 @@ class QualityAssessment:
     passed: bool
     score: float
     reasons: list[str] = field(default_factory=list)
-
-
-def _extract_text(response: ChatCompletionResponse) -> str:
-    if not response.choices:
-        return ""
-    content = response.choices[0].message.get("content")
-    return content if isinstance(content, str) else ""
 
 
 def _has_degenerate_word_repetition(text: str) -> bool:
@@ -79,7 +72,7 @@ def _tool_call_was_forced(request: ChatCompletionRequest) -> bool:
 def assess(response: ChatCompletionResponse, request: ChatCompletionRequest, min_score: float = 0.5) -> QualityAssessment:
     reasons: list[str] = []
     score = 1.0
-    text = _extract_text(response)
+    text = extract_message_text(response)
     message = response.choices[0].message if response.choices else {}
     finish_reason = response.choices[0].finish_reason if response.choices else None
     has_tool_calls = bool(message.get("tool_calls"))

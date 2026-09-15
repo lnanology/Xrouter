@@ -117,3 +117,29 @@ def test_request_body_too_large_rejected(client):
 def test_docs_available(client):
     resp = client.get("/docs")
     assert resp.status_code == 200
+
+
+def test_dag_run_empty_nodes_returns_400(client):
+    resp = client.post("/v1/dag/run", json={"nodes": []})
+    assert resp.status_code == 400
+    assert resp.json()["detail"]["type"] == "xrouter_error"
+
+
+def test_dag_run_cycle_returns_400(client):
+    resp = client.post("/v1/dag/run", json={"nodes": [
+        {"id": "a", "depends_on": ["b"], "messages": [{"role": "user", "content": "hi"}]},
+        {"id": "b", "depends_on": ["a"], "messages": [{"role": "user", "content": "hi"}]},
+    ]})
+    assert resp.status_code == 400
+    assert "cycle" in resp.json()["detail"]["message"]
+
+
+def test_dag_run_well_formed_but_no_providers_returns_200_with_failed_node(client):
+    # A valid DAG still gets a 200 with per-node status — unlike the plain
+    # /v1/chat/completions 503, a DAG run's "something failed" is reported
+    # inside the body since a run can be partially successful.
+    resp = client.post("/v1/dag/run", json={"nodes": [{"id": "a", "messages": [{"role": "user", "content": "hi"}]}]})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "failed"
+    assert body["nodes"][0]["status"] == "failed"

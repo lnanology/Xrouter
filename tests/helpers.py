@@ -34,6 +34,7 @@ class FakeProvider(Provider):
         self.finish_reason = finish_reason
         self.call_count = 0
         self.cancelled = False
+        self.last_request: ChatCompletionRequest | None = None
 
     def capabilities(self) -> set[ProviderCapability]:
         return {ProviderCapability.CHAT, ProviderCapability.STREAMING}
@@ -67,6 +68,7 @@ class FakeProvider(Provider):
             raise ProviderAuthError("simulated bad key", provider_id=self.id)
 
     async def chat(self, model: str, request: ChatCompletionRequest) -> ChatCompletionResponse:
+        self.last_request = request
         if self.delay_seconds:
             try:
                 await asyncio.sleep(self.delay_seconds)
@@ -91,6 +93,72 @@ class FakeProvider(Provider):
                 model=f"{self.id}/{model}",
                 choices=[ChatCompletionChunkChoice(index=0, delta={"content": f"chunk{i}"}, finish_reason=None)],
             )
+
+
+async def build_test_engine(tmp_path, provider_specs: dict[str, dict], **routing_overrides):
+    """Assembles a real ChatEngine wired to FakeProviders instead of real
+    adapters — the same pieces app.core.lifecycle.startup() assembles into
+    an AppContext, minus config-driven provider construction. Lets tests
+    that need ChatEngine.handle_chat() end-to-end (the DAG executor, e.g.)
+    run without a real Ollama/cloud provider available.
+
+    provider_specs: {provider_id: {kwarg: value, ...}} passed straight
+    through to FakeProvider (behavior, content, delay_seconds, ...).
+    routing_overrides: passed straight through to RoutingConfig; defaults
+    task_aware_policy to False so tests get a predictable routing policy
+    unless they override it."""
+    from app.cache.manager import CacheManager
+    from app.core.config import CacheConfig, RoutingConfig, ServerConfig, Settings
+    from app.core.context import AppContext
+    from app.core.engine import ChatEngine
+    from app.core.registry import ModelRegistry, ProviderRegistry
+    from app.observability.events import EventBus
+    from app.observability.metrics import MetricsCollector
+    from app.quota.tracker import QuotaTracker
+    from app.reliability.circuit_breaker import CircuitBreakerRegistry
+    from app.routing.router import AdaptiveRouter
+    from app.routing.scheduler import ConcurrencyLimiter
+    from app.storage.database import Database
+    from app.storage.repositories.metrics import MetricsRepository
+    from app.storage.repositories.model import ModelRepository
+    from app.storage.repositories.provider import ProviderRepository
+    from app.storage.repositories.request import RequestRepository
+
+    db_path = str(tmp_path / "test.sqlite3")
+    db = Database(db_path)
+    await db.init()
+
+    providers = ProviderRegistry()
+    limiter = ConcurrencyLimiter(global_limit=32)
+    for pid, spec in provider_specs.items():
+        cfg = ProviderConfig(id=pid, name=pid, type="openai_compatible", timeout_seconds=2.0)
+        fake = FakeProvider(cfg, [make_model(pid)], **spec)
+        providers.register(fake, cfg)
+        limiter.configure_provider(pid, 4)
+
+    models = ModelRegistry()
+    await models.refresh(providers)
+
+    circuits = CircuitBreakerRegistry()
+    quota = QuotaTracker()
+    events = EventBus()
+    metrics = MetricsCollector()
+
+    routing_defaults = {"task_aware_policy": False}
+    routing_defaults.update(routing_overrides)
+    routing = RoutingConfig(**routing_defaults)
+    settings = Settings(server=ServerConfig(), routing=routing, cache=CacheConfig(enabled=False), providers={}, raw_routing={})
+
+    router = AdaptiveRouter(providers, models, circuits, quota, default_policy=routing.default_policy)
+    cache = CacheManager(settings.cache, db_path)
+
+    ctx = AppContext(
+        settings=settings, providers=providers, models=models, circuits=circuits, quota=quota,
+        router=router, limiter=limiter, cache=cache, metrics=metrics, events=events, db=db,
+        provider_repo=ProviderRepository(db), model_repo=ModelRepository(db), request_repo=RequestRepository(db),
+        metrics_repo=MetricsRepository(db), health_monitor=None, performance=None,
+    )
+    return ChatEngine(ctx)
 
 
 def make_model(provider_id: str, name: str = "test-model", **overrides) -> ModelInfo:
