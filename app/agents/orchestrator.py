@@ -42,10 +42,15 @@ standing team member -- but unlike Evidence Graph, it runs at every
 tier including 0-1, since identifying the final answer's own load-bearing
 assumptions needs only the task and the answer, never a DAG. It's pure
 advisory annotation, same as Evidence Graph -- it never revises the
-answer itself, that's Debate's job. The remaining two Phase 4 pieces
-(Simulation/Confidence Engine) are deliberately NOT part of tier 4 here --
-they belong to later steps, and a stub would be fake by definition.
-"Coder" (named
+answer itself, that's Debate's job. Simulation (Phase 4's fourth piece,
+app/agents/simulation.py) is also opt-in (OrchestrationRequest.simulate,
+a caller-supplied list of changed-premise scenarios), and also runs at
+every tier including 0-1 for the same "doesn't need a DAG" reason -- but
+unlike Counterfactual, which guesses how the answer would change,
+Simulation actually re-answers the task once per scenario, a genuine
+re-execution rather than a judgment. The last Phase 4 piece (Confidence
+Engine) is deliberately NOT part of tier 4 here -- it belongs to a later
+step, and a stub would be fake by definition. "Coder" (named
 once in the spec's agents/ listing, never detailed elsewhere) also isn't
 a separate stage: task_type=CODE already gets a quality-biased routing
 policy from the Task Classifier, which is the existing, real behavior
@@ -64,6 +69,7 @@ import time
 from typing import TYPE_CHECKING
 
 from app.agents.debate import debate
+from app.agents.simulation import run_simulations
 from app.agents.synthesizer import synthesize
 from app.contracts.counterfactual import CounterfactualAnalysis
 from app.contracts.dag import DagNodeRequest, DagRunRequest, DagRunResponse
@@ -73,6 +79,7 @@ from app.contracts.orchestrator import OrchestrationRequest, OrchestrationResult
 from app.contracts.planner import PlanRequest, PlanSpec
 from app.contracts.request import ChatCompletionRequest, ChatMessage
 from app.contracts.response import ChatCompletionResponse, extract_message_text
+from app.contracts.simulation import SimulationRun
 from app.core.errors import NoAvailableModelError, OrchestrationError
 from app.execution.dag import DagExecutor
 from app.execution.plan_runner import run_plan_with_verification
@@ -186,6 +193,25 @@ async def _maybe_trace_counterfactual(
     return analysis
 
 
+async def _maybe_run_simulations(
+    engine: "ChatEngine", request: OrchestrationRequest, team: list[str],
+) -> list[SimulationRun]:
+    """Actually re-answers the task once per caller-supplied scenario in
+    request.simulate -- a genuine re-execution, not a guess (that's
+    _maybe_trace_counterfactual's job). Unlike the evidence/counterfactual
+    helpers, "simulation" is only added to `team` when at least one
+    scenario actually produced a result: there's no honest "attempted but
+    empty" state here, an entirely-failed batch just didn't run."""
+    if not request.simulate:
+        return []
+    runs = await run_simulations(
+        engine, request.task, request.simulate, context=request.context, routing_policy=request.routing_policy,
+    )
+    if runs:
+        team.append("simulation")
+    return runs
+
+
 async def _synthesize_or_fallback(engine: "ChatEngine", request: OrchestrationRequest, dag: DagRunResponse) -> tuple[str, bool]:
     """Returns (answer, used_synthesizer). Raises OrchestrationError if
     every node in the DAG failed -- there is nothing honest to synthesize
@@ -215,9 +241,11 @@ async def orchestrate(engine: "ChatEngine", request: OrchestrationRequest) -> Or
         answer = extract_message_text(response).strip()
         team = ["solver"]
         counterfactual = await _maybe_trace_counterfactual(engine, request, answer, None, team)
+        simulations = await _maybe_run_simulations(engine, request, team)
         return OrchestrationResult(
             id=new_id("orch"), team=team, complexity=complexity, task_type=task_type,
-            answer=answer, counterfactual=counterfactual, latency_ms=round((time.time() - start) * 1000, 1),
+            answer=answer, counterfactual=counterfactual, simulations=simulations,
+            latency_ms=round((time.time() - start) * 1000, 1),
         )
 
     context = await _recall(engine, request)
@@ -231,10 +259,11 @@ async def orchestrate(engine: "ChatEngine", request: OrchestrationRequest) -> Or
         team = ["solver", "critic"]
         evidence = await _maybe_trace_evidence(engine, request, answer, dag_result, team)
         counterfactual = await _maybe_trace_counterfactual(engine, request, answer, dag_result, team)
+        simulations = await _maybe_run_simulations(engine, request, team)
         await _remember(engine, request, answer)
         return OrchestrationResult(
             id=new_id("orch"), team=team, complexity=complexity, task_type=task_type,
-            answer=answer, dag=dag_result, evidence=evidence, counterfactual=counterfactual,
+            answer=answer, dag=dag_result, evidence=evidence, counterfactual=counterfactual, simulations=simulations,
             latency_ms=round((time.time() - start) * 1000, 1),
         )
 
@@ -270,10 +299,12 @@ async def orchestrate(engine: "ChatEngine", request: OrchestrationRequest) -> Or
 
     evidence = await _maybe_trace_evidence(engine, request, answer, plan_result.dag, team)
     counterfactual = await _maybe_trace_counterfactual(engine, request, answer, plan_result.dag, team)
+    simulations = await _maybe_run_simulations(engine, request, team)
     await _remember(engine, request, answer)
 
     return OrchestrationResult(
         id=new_id("orch"), team=team, complexity=complexity, task_type=task_type,
         answer=answer, dag=plan_result.dag, verification=plan_result.verification, debate=debate_result,
-        evidence=evidence, counterfactual=counterfactual, latency_ms=round((time.time() - start) * 1000, 1),
+        evidence=evidence, counterfactual=counterfactual, simulations=simulations,
+        latency_ms=round((time.time() - start) * 1000, 1),
     )

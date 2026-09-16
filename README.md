@@ -30,14 +30,16 @@ critic + research + verifier + synthesizer), a standalone Researcher
 (`POST /v1/research`), and Memory/RAG — a real, keyword-based retrieve →
 augment-context → generate loop backed by a persistent, scope-isolated
 memory store, honestly scoped short of semantic search since XRouter has
-no embedding provider or vector store yet. Three pieces of **Phase 4** are
+no embedding provider or vector store yet. Four pieces of **Phase 4** are
 in too: an Evidence Graph that traces a finished answer's own claims back
 to whichever DAG step actually produced each one, a Debate stage —
 automatic at tier 4 — where an Advocate and a Skeptic argue for and
 against the draft answer and a Judge reconciles both into a final,
-strengthened one, and a Counterfactual analysis that identifies an
-answer's own load-bearing assumptions and how the answer would change if
-each one didn't hold.
+strengthened one, a Counterfactual analysis that identifies an answer's
+own load-bearing assumptions and how the answer would change if each one
+didn't hold, and Simulation, which actually re-answers the task under a
+caller-supplied changed premise instead of just guessing what would
+happen.
 
 ## Quick start
 
@@ -450,6 +452,7 @@ curl http://localhost:20128/v1/agents/run \
   "debate": { "...": "set only at tier 4, and only when the debate actually completed" },
   "evidence": { "...": "set only when trace_evidence was requested" },
   "counterfactual": { "...": "set only when trace_counterfactual was requested" },
+  "simulations": [{ "...": "one entry per scenario in `simulate` that actually produced an answer" }],
   "latency_ms": 2140.7
 }
 ```
@@ -477,20 +480,20 @@ used. The tiers, straight from the routing table in the spec:
   forced, since forcing a tool call a task doesn't actually need would be
   exactly the "fake placeholder functionality" the project's rules forbid.
 
-Three of Phase 4's five pieces are wired in on top of these tiers — see
+Four of Phase 4's five pieces are wired in on top of these tiers — see
 their own sections below for the full reasoning. Debate is the one
 exception to "`team` only reflects what a tier actually ran, nothing
 opt-in by default": it's a spec-named *standing* member of the tier-4
 team (section 十九's own "very hard" table lists it right next to
 Verification), so it runs automatically whenever complexity reaches tier
-4, no flag required. Evidence Graph and Counterfactual are both opt-in
-(`trace_evidence` / `trace_counterfactual`) since neither is named in
-that table. Simulation and Confidence Engine are the two Phase 4 pieces
-still unbuilt — a stub here would be fake by definition, so they simply
-aren't part of any tier yet. "Coder" also isn't a separate stage:
-`task_type: code` already gets a quality-biased routing policy from the
-Task Classifier, which is the existing, real behavior this module reuses
-rather than duplicating.
+4, no flag required. Evidence Graph, Counterfactual, and Simulation are
+all opt-in (`trace_evidence` / `trace_counterfactual` / `simulate`) since
+none of the three is named in that table. Confidence Engine is the one
+Phase 4 piece still unbuilt — a stub here would be fake by definition, so
+it simply isn't part of any tier yet. "Coder" also isn't a separate
+stage: `task_type: code` already gets a quality-biased routing policy
+from the Task Classifier, which is the existing, real behavior this
+module reuses rather than duplicating.
 Response codes mirror the pieces it's built from: `503` if no provider
 could even answer (nothing to report yet), `422` if the Planner exhausted
 every retry, `503` (`OrchestrationError`) if a whole DAG's worth of steps
@@ -702,17 +705,74 @@ context, never a requirement.
 
 Deliberately scoped **away** from actually re-running anything: no input
 gets perturbed and no DAG gets re-executed here, that's left entirely to
-Simulation (Phase 4's next, still-unbuilt piece) so the two pieces never
-duplicate the same execution machinery before Simulation's own scope
-even exists. Pure advisory annotation, same family as Evidence Graph, not
-Debate — it never revises `OrchestrationResult.answer`, only adds
-optional metadata beside it. Fails open exactly like Evidence Graph: a
-missing/malformed tool call, or no provider able to answer at all,
-returns an empty analysis rather than losing the answer that's already
-been produced. `"counterfactual"` is added to `team` whenever
-`trace_counterfactual` was requested, whether or not the analysis itself
-came back non-empty — same "team reflects the attempt, not just the
-outcome" convention `trace_evidence` already uses.
+Simulation (Phase 4's next piece, see below) so the two pieces never
+duplicate the same execution machinery. Pure advisory annotation, same
+family as Evidence Graph, not Debate — it never revises
+`OrchestrationResult.answer`, only adds optional metadata beside it.
+Fails open exactly like Evidence Graph: a missing/malformed tool call, or
+no provider able to answer at all, returns an empty analysis rather than
+losing the answer that's already been produced. `"counterfactual"` is
+added to `team` whenever `trace_counterfactual` was requested, whether or
+not the analysis itself came back non-empty — same "team reflects the
+attempt, not just the outcome" convention `trace_evidence` already uses.
+
+### Simulation (Phase 4, opt-in: `"simulate": ["..."]`)
+
+The fourth piece of Phase 4: where Counterfactual *guesses* how the
+answer would change under a different premise, `app/agents/simulation.py`
+*actually re-answers* the original task once per caller-supplied
+scenario, told to genuinely work out the answer under that changed
+premise rather than describe how it might change:
+
+```bash
+curl http://localhost:20128/v1/agents/run \
+  -H "Content-Type: application/json" \
+  -d '{"task": "Should we use microservices or a monolith for a 3-person startup building an MVP?", "simulate": ["assume the team grows to 15 engineers within a year"]}'
+```
+
+```json
+{
+  "...": "the rest of the OrchestrationResult",
+  "simulations": [
+    {
+      "scenario": "assume the team grows to 15 engineers within a year",
+      "answer": "... a genuinely different answer, worked out under that premise ..."
+    }
+  ]
+}
+```
+
+XRouter deliberately never invents the scenarios itself — Counterfactual
+already owns "identify what's load-bearing"; if Simulation also guessed
+its own scenarios, it would either duplicate that judgment or silently
+second-guess it. So a caller who ran Counterfactual now has concrete
+premises in hand to actually test here, and the two pieces stay honestly
+divided: reasoning in Counterfactual, real execution in Simulation.
+
+Each scenario is one plain prose call (same family as Synthesizer/
+Debate — a generative answer, not a structured judgment, so no forced
+tool call), never a recursive call back into the Orchestrator's own
+`orchestrate()`. Re-running the whole Planner/Critic/Verifier/Debate
+pipeline per scenario would make `simulate` an unbounded cost multiplier
+on an already-expensive tier-4 request; one direct call per scenario
+keeps this honestly bounded. `simulate` is capped at 3 scenarios — extras
+are dropped with a logged warning rather than silently fanning out
+further, and blank entries are skipped. Like Counterfactual, it needs
+only the task and context, never a DAG, so it genuinely runs at every
+tier including 0-1.
+
+Fails open **per scenario**, inside the module, not propagated to the
+caller: scenarios are independent, so one `NoAvailableModelError` only
+drops that one scenario's result, not the whole batch — matches Evidence
+Graph/Counterfactual's "fail open, keep going" discipline, not Debate's
+"roll the whole thing back" (there's no single draft to protect here) or
+Synthesizer's "propagate to a caller with a real fallback" (there's no
+meaningful fallback content for one simulated scenario — it simply
+doesn't appear in the results). Unlike `trace_evidence`/
+`trace_counterfactual`, `"simulation"` is only added to `team` when at
+least one scenario actually produced a result — there's no honest
+"attempted but empty" state the way an LLM judgment can legitimately
+return zero claims/points; an entirely-failed batch just didn't run.
 
 ## Tests
 
@@ -721,7 +781,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-313 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+325 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -870,7 +930,19 @@ Orchestrator — the key behavioral difference from Evidence Graph proven
 directly: `trace_counterfactual` genuinely running (and calling the
 provider) at tier 0-1 where `trace_evidence` is a no-op, plus tier 2 and
 a tier 4 run confirming it runs after Debate's own revision, on the
-Judge's resolution rather than the pre-debate draft.
+Judge's resolution rather than the pre-debate draft. Simulation
+(`tests/agents/test_simulation.py`, `tests/agents/test_orchestrator.py`)
+— pure request-building with/without context, a happy path actually
+running two independent scenarios and returning both, the `_MAX_SCENARIOS`
+cap genuinely dropping a 4th scenario before it ever reaches the
+provider, blank scenarios skipped, one scenario's `NoAvailableModelError`
+(after exhausting its own internal retries) leaving the other scenario's
+result intact rather than losing the whole batch, an entirely-failed
+batch returning an empty list rather than raising, and — end-to-end
+through the Orchestrator — `simulate` genuinely running at tier 0-1 (same
+proof point as Counterfactual), a tier-2 run with two scenarios, and
+`"simulation"` only appearing in `team` when at least one scenario
+actually produced a result.
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -1038,18 +1110,29 @@ answer's own load-bearing assumptions and how the answer would change if
 each one didn't hold, also a forced tool call
 (`submit_counterfactual_analysis`) rather than a heuristic; deliberately
 scoped away from actually re-running anything (that's Simulation's job,
-next) so it stays pure analysis of an answer that already exists — see
-the Counterfactual section above for the full reasoning. Unlike Evidence
-Graph, genuinely runs at every tier including 0-1, since it needs only
-the task and the final answer, never a DAG. Fails open exactly like
-Evidence Graph, and never revises `OrchestrationResult.answer` — pure
-advisory annotation, the same family as Evidence Graph rather than
-Debate.
+see below) so it stays pure analysis of an answer that already exists —
+see the Counterfactual section above for the full reasoning. Unlike
+Evidence Graph, genuinely runs at every tier including 0-1, since it
+needs only the task and the final answer, never a DAG. Fails open exactly
+like Evidence Graph, and never revises `OrchestrationResult.answer` —
+pure advisory annotation, the same family as Evidence Graph rather than
+Debate. Simulation (`app/agents/simulation.py`,
+`app/contracts/simulation.py`) — opt-in (`OrchestrationRequest.simulate`,
+a caller-supplied list of changed-premise scenarios) actual re-execution
+of the task under each one, a plain prose call (no forced tool call,
+same family as Synthesizer/Debate) rather than a heuristic; deliberately
+takes scenarios as caller input rather than inventing its own, so it
+never duplicates or second-guesses Counterfactual's own judgment about
+what's load-bearing — see the Simulation section above for the full
+reasoning. Capped at 3 scenarios per request, and like Counterfactual
+runs at every tier including 0-1. Fails open **per scenario** rather than
+as a whole batch, since scenarios are independent; `"simulation"` is only
+added to `team` when at least one scenario actually produced a result.
 
 ## What's not implemented yet (by design — see Phase 4-5 in the spec)
 
-The rest of Phase 4 (Simulation, Confidence Engine — Evidence Graph,
-Debate and Counterfactual are done, see above) and all of Phase 5
+The last piece of Phase 4 (Confidence Engine — Evidence Graph, Debate,
+Counterfactual and Simulation are done, see above) and all of Phase 5
 (Evolution Engine, A/B Routing, Policy Learning, Self-healing, Automated
 Benchmark) haven't started; being built one piece at a time, in that
 order, each with its own review checkpoint. Also still open: other tool

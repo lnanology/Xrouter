@@ -510,3 +510,86 @@ async def test_orchestrate_trace_counterfactual_fails_open_without_losing_the_an
     assert result.answer == "a solid answer"
     assert result.team == ["solver", "critic", "counterfactual"]
     assert result.counterfactual.points == []
+
+
+# --- orchestrate(): simulate (Phase 4: Simulation) ---------------------------
+
+@pytest.mark.asyncio
+async def test_orchestrate_tier0_1_simulate_works_without_a_dag(tmp_path):
+    # Same key behavioral point as trace_counterfactual: this genuinely
+    # runs at tier 0-1, since it never needs a DAG.
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"content": "hello there"},
+        {"content": "under the changed premise, a different answer"},
+    ]}})
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER0, simulate=["what if X instead"]))
+
+    assert result.team == ["solver", "simulation"]
+    assert result.answer == "hello there"
+    assert len(result.simulations) == 1
+    assert result.simulations[0].scenario == "what if X instead"
+    assert result.simulations[0].answer == "under the changed premise, a different answer"
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_tier2_with_simulate_runs_two_scenarios(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"content": "a solid answer"},
+        {"tool_calls": [_critique_tool_call(True)]},
+        {"content": "scenario A's answer"},
+        {"content": "scenario B's answer"},
+    ]}})
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER2, simulate=["scenario A", "scenario B"]))
+
+    assert result.team == ["solver", "critic", "simulation"]
+    assert len(result.simulations) == 2
+    assert result.simulations[0].answer == "scenario A's answer"
+    assert result.simulations[1].answer == "scenario B's answer"
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 4
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_simulate_one_scenario_failing_still_keeps_the_other_and_the_answer(tmp_path):
+    # A single failed candidate retries internally (RetryConfig's default
+    # of 3 total attempts) before engine.handle_chat() gives up -- so the
+    # "fails" scenario's request must keep failing across calls 3-5 (all
+    # of its attempts), not just once, to genuinely fail rather than
+    # succeed on a retry.
+    def _fail_for_calls_three_through_five(count: int) -> None:
+        if 3 <= count <= 5:
+            from app.core.errors import ProviderServerError
+
+            raise ProviderServerError("simulated 500", provider_id="solo")
+
+    engine = await build_test_engine(tmp_path, {"solo": {
+        "behavior": _fail_for_calls_three_through_five,
+        "responses": [
+            {"content": "a solid answer"},                          # 1: solver
+            {"tool_calls": [_critique_tool_call(True)]},             # 2: critique
+            {"content": "n/a"}, {"content": "n/a"}, {"content": "n/a"},  # 3-5: "fails" scenario's attempts
+            {"content": "the surviving scenario's answer"},          # 6: "succeeds" scenario
+        ],
+    }})
+
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER2, simulate=["fails", "succeeds"]))
+
+    # A failed scenario is advisory-metadata fail-open, same as evidence/
+    # counterfactual -- it must never take down the already-produced answer.
+    assert result.answer == "a solid answer"
+    assert result.team == ["solver", "critic", "simulation"]
+    assert len(result.simulations) == 1
+    assert result.simulations[0].scenario == "succeeds"
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_simulate_is_a_noop_when_not_requested(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"content": "hello there"}})
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER0))
+
+    assert result.team == ["solver"]
+    assert result.simulations == []
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 1
