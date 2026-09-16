@@ -30,12 +30,14 @@ critic + research + verifier + synthesizer), a standalone Researcher
 (`POST /v1/research`), and Memory/RAG — a real, keyword-based retrieve →
 augment-context → generate loop backed by a persistent, scope-isolated
 memory store, honestly scoped short of semantic search since XRouter has
-no embedding provider or vector store yet. Two pieces of **Phase 4** are
+no embedding provider or vector store yet. Three pieces of **Phase 4** are
 in too: an Evidence Graph that traces a finished answer's own claims back
-to whichever DAG step actually produced each one, and a Debate stage —
+to whichever DAG step actually produced each one, a Debate stage —
 automatic at tier 4 — where an Advocate and a Skeptic argue for and
 against the draft answer and a Judge reconciles both into a final,
-strengthened one.
+strengthened one, and a Counterfactual analysis that identifies an
+answer's own load-bearing assumptions and how the answer would change if
+each one didn't hold.
 
 ## Quick start
 
@@ -439,12 +441,15 @@ curl http://localhost:20128/v1/agents/run \
 ```json
 {
   "id": "orch_...",
-  "team": ["planner", "specialists", "critic", "verifier"],
+  "team": ["planner", "specialists", "critic", "verifier", "debate"],
   "complexity": 4,
   "task_type": "reasoning",
   "answer": "...",
   "dag": { "...": "set whenever the team ran more than a bare single call" },
   "verification": { "...": "set only at tier 4" },
+  "debate": { "...": "set only at tier 4, and only when the debate actually completed" },
+  "evidence": { "...": "set only when trace_evidence was requested" },
+  "counterfactual": { "...": "set only when trace_counterfactual was requested" },
   "latency_ms": 2140.7
 }
 ```
@@ -472,12 +477,20 @@ used. The tiers, straight from the routing table in the spec:
   forced, since forcing a tool call a task doesn't actually need would be
   exactly the "fake placeholder functionality" the project's rules forbid.
 
-Debate (Evidence Graph / Debate / Counterfactual / Simulation / Confidence
-Engine — the real Phase 4) is deliberately **not** part of tier 4 — it
-belongs to the next phase, and a stub here would be fake by definition.
-"Coder" also isn't a separate stage: `task_type: code` already gets a
-quality-biased routing policy from the Task Classifier, which is the
-existing, real behavior this module reuses rather than duplicating.
+Three of Phase 4's five pieces are wired in on top of these tiers — see
+their own sections below for the full reasoning. Debate is the one
+exception to "`team` only reflects what a tier actually ran, nothing
+opt-in by default": it's a spec-named *standing* member of the tier-4
+team (section 十九's own "very hard" table lists it right next to
+Verification), so it runs automatically whenever complexity reaches tier
+4, no flag required. Evidence Graph and Counterfactual are both opt-in
+(`trace_evidence` / `trace_counterfactual`) since neither is named in
+that table. Simulation and Confidence Engine are the two Phase 4 pieces
+still unbuilt — a stub here would be fake by definition, so they simply
+aren't part of any tier yet. "Coder" also isn't a separate stage:
+`task_type: code` already gets a quality-biased routing policy from the
+Task Classifier, which is the existing, real behavior this module reuses
+rather than duplicating.
 Response codes mirror the pieces it's built from: `503` if no provider
 could even answer (nothing to report yet), `422` if the Planner exhausted
 every retry, `503` (`OrchestrationError`) if a whole DAG's worth of steps
@@ -645,6 +658,62 @@ lost to a best-effort enrichment" discipline `_synthesize_or_fallback`
 itself already applies to a failed `synthesize()` call. `"debate"` is
 only added to `team` when it actually completed. Never runs at tier ≤ 3.
 
+### Counterfactual (Phase 4, opt-in: `"trace_counterfactual": true`)
+
+The third piece of Phase 4: `app/intelligence/counterfactual.py` asks —
+another forced tool call (`submit_counterfactual_analysis`), not a
+heuristic — which of the final answer's own premises are actually
+load-bearing, and for each one, how the answer would meaningfully change
+if it turned out to be false:
+
+```bash
+curl http://localhost:20128/v1/agents/run \
+  -H "Content-Type: application/json" \
+  -d '{"task": "What is the capital of France?", "trace_counterfactual": true}'
+```
+
+```json
+{
+  "...": "the rest of the OrchestrationResult",
+  "counterfactual": {
+    "points": [
+      {
+        "assumption": "the question refers to mainland France, not an overseas territory",
+        "if_false": "the seat of government for an overseas territory would be a different city entirely"
+      }
+    ]
+  }
+}
+```
+
+Not named in spec section 十九's own "Very hard" team table (unlike
+Debate), so it ships opt-in exactly like Evidence Graph, same reasoning:
+an extra call shouldn't turn on silently. But it's a genuinely different
+shape from Evidence Graph, not a copy of it — Evidence Graph traces
+claims to specific DAG nodes, so it's a structural no-op below tier 2 (no
+DAG exists yet at tier 0-1); Counterfactual's question is "what does this
+answer's own reasoning depend on", which needs only the task and the
+final answer, never a DAG. So `trace_counterfactual` genuinely runs at
+**every** tier, including 0-1 — the one place `trace_evidence` can't
+reach. When a DAG did run, its own step-by-step summary is folded in as
+extra grounding, the fifth module to reuse `summarize_dag()` now (after
+the Verifier, Synthesizer, Evidence Graph and Debate), but it's optional
+context, never a requirement.
+
+Deliberately scoped **away** from actually re-running anything: no input
+gets perturbed and no DAG gets re-executed here, that's left entirely to
+Simulation (Phase 4's next, still-unbuilt piece) so the two pieces never
+duplicate the same execution machinery before Simulation's own scope
+even exists. Pure advisory annotation, same family as Evidence Graph, not
+Debate — it never revises `OrchestrationResult.answer`, only adds
+optional metadata beside it. Fails open exactly like Evidence Graph: a
+missing/malformed tool call, or no provider able to answer at all,
+returns an empty analysis rather than losing the answer that's already
+been produced. `"counterfactual"` is added to `team` whenever
+`trace_counterfactual` was requested, whether or not the analysis itself
+came back non-empty — same "team reflects the attempt, not just the
+outcome" convention `trace_evidence` already uses.
+
 ## Tests
 
 ```bash
@@ -652,7 +721,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-296 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+313 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -790,7 +859,18 @@ truncating an oversized advocate/skeptic argument instead of embedding it
 whole, and — end-to-end through the Orchestrator — tier 4 both running
 debate and replacing `answer` with its resolution, `"debate"` only
 appearing in `team` when it actually completed, and tier 3 never
-triggering it at all.
+triggering it at all. Counterfactual
+(`tests/execution/test_counterfactual.py`,
+`tests/agents/test_orchestrator.py`) — pure request-building with and
+without a dag and with/without context, `_sanitize_points` dropping
+entries missing either field, fail-open on no provider / no tool call /
+malformed arguments, an explicitly-empty points list round-tripping
+correctly (never forced non-empty), and — end-to-end through the
+Orchestrator — the key behavioral difference from Evidence Graph proven
+directly: `trace_counterfactual` genuinely running (and calling the
+provider) at tier 0-1 where `trace_evidence` is a no-op, plus tier 2 and
+a tier 4 run confirming it runs after Debate's own revision, on the
+Judge's resolution rather than the pre-debate draft.
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -951,15 +1031,29 @@ away — see the Debate section above. Fails open with a sharper edge than
 Evidence Graph (any failed call, or an empty judge output, rolls back to
 the untouched pre-debate draft, since there's no harmless "return
 nothing" option for a step that's supposed to revise the answer).
+Counterfactual (`app/intelligence/counterfactual.py`,
+`app/contracts/counterfactual.py`) — opt-in
+(`OrchestrationRequest.trace_counterfactual`) identification of a finished
+answer's own load-bearing assumptions and how the answer would change if
+each one didn't hold, also a forced tool call
+(`submit_counterfactual_analysis`) rather than a heuristic; deliberately
+scoped away from actually re-running anything (that's Simulation's job,
+next) so it stays pure analysis of an answer that already exists — see
+the Counterfactual section above for the full reasoning. Unlike Evidence
+Graph, genuinely runs at every tier including 0-1, since it needs only
+the task and the final answer, never a DAG. Fails open exactly like
+Evidence Graph, and never revises `OrchestrationResult.answer` — pure
+advisory annotation, the same family as Evidence Graph rather than
+Debate.
 
 ## What's not implemented yet (by design — see Phase 4-5 in the spec)
 
-The rest of Phase 4 (Counterfactual, Simulation, Confidence
-Engine — Evidence Graph and Debate are done, see above) and all of Phase
-5 (Evolution Engine, A/B Routing, Policy Learning, Self-healing,
-Automated Benchmark) haven't started; being built one piece at a time, in
-that order, each with its own review checkpoint. Also still open: other
-tool types beyond
+The rest of Phase 4 (Simulation, Confidence Engine — Evidence Graph,
+Debate and Counterfactual are done, see above) and all of Phase 5
+(Evolution Engine, A/B Routing, Policy Learning, Self-healing, Automated
+Benchmark) haven't started; being built one piece at a time, in that
+order, each with its own review checkpoint. Also still open: other tool
+types beyond
 `web_search`, multi-turn agent loops,
 tool-using agents that act on a plan's own intermediate results mid-run
 rather than a single forced-JSON planning call up front, a real

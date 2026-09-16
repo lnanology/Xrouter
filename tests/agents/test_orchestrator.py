@@ -12,6 +12,7 @@ from app.agents.orchestrator import (
 from app.contracts.orchestrator import OrchestrationRequest
 from app.contracts.planner import PlanNodeSpec, PlanSpec
 from app.core.errors import OrchestrationError
+from app.intelligence.counterfactual import COUNTERFACTUAL_TOOL_NAME
 from app.intelligence.critic import CRITIQUE_TOOL_NAME
 from app.intelligence.evidence import EVIDENCE_TOOL_NAME
 from app.intelligence.planner import PLAN_TOOL_NAME
@@ -50,6 +51,13 @@ def _evidence_tool_call(claims: list[dict]) -> dict:
     return {
         "id": "call_1", "type": "function",
         "function": {"name": EVIDENCE_TOOL_NAME, "arguments": json.dumps({"claims": claims})},
+    }
+
+
+def _counterfactual_tool_call(points: list[dict]) -> dict:
+    return {
+        "id": "call_1", "type": "function",
+        "function": {"name": COUNTERFACTUAL_TOOL_NAME, "arguments": json.dumps({"points": points})},
     }
 
 
@@ -421,3 +429,84 @@ async def test_orchestrate_tier3_plan_without_tool_nodes_omits_research_tag(tmp_
     result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER3))
     assert "research" not in result.team
     assert "verifier" not in result.team
+
+
+# --- orchestrate(): trace_counterfactual (Phase 4: Counterfactual) ----------
+
+@pytest.mark.asyncio
+async def test_orchestrate_tier0_1_trace_counterfactual_works_without_a_dag(tmp_path):
+    # The key behavioral difference from trace_evidence: this genuinely
+    # runs at tier 0-1, since it never needs a DAG.
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"content": "hello there"},
+        {"tool_calls": [_counterfactual_tool_call([{"assumption": "a", "if_false": "b"}])]},
+    ]}})
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER0, trace_counterfactual=True))
+
+    assert result.team == ["solver", "counterfactual"]
+    assert result.answer == "hello there"
+    assert result.counterfactual is not None
+    assert result.counterfactual.points[0].assumption == "a"
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_tier2_with_trace_counterfactual_attaches_analysis(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"content": "a solid answer"},
+        {"tool_calls": [_critique_tool_call(True)]},
+        {"tool_calls": [_counterfactual_tool_call([{"assumption": "a", "if_false": "b"}])]},
+    ]}})
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER2, trace_counterfactual=True))
+
+    assert result.team == ["solver", "critic", "counterfactual"]
+    assert result.counterfactual is not None
+    assert result.counterfactual.points[0].if_false == "b"
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 3
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_tier4_trace_counterfactual_runs_after_debate(tmp_path):
+    plan_json = [{"id": "solve", "prompt": "work the problem"}]
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"tool_calls": [_plan_tool_call(plan_json)]},           # 1: plan
+        {"content": "researched answer"},                        # 2: node
+        {"tool_calls": [_critique_tool_call(True)]},              # 3: forced critique
+        {"tool_calls": [_verify_tool_call(True)]},                # 4: verifier
+        {"content": "the case for this answer"},                  # 5: debate advocate
+        {"content": "a counterpoint to consider"},                # 6: debate skeptic
+        {"content": "the final, strengthened answer"},            # 7: debate judge
+        {"tool_calls": [_counterfactual_tool_call([{"assumption": "a", "if_false": "b"}])]},  # 8: counterfactual
+    ]}})
+
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER4, trace_counterfactual=True))
+
+    assert result.team == ["planner", "specialists", "critic", "verifier", "debate", "counterfactual"]
+    assert result.answer == "the final, strengthened answer"
+    assert result.counterfactual is not None
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 8
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_trace_counterfactual_fails_open_without_losing_the_answer(tmp_path):
+    def _fail_from_third_call(count: int) -> None:
+        if count >= 3:
+            from app.core.errors import ProviderServerError
+
+            raise ProviderServerError("simulated 500", provider_id="solo")
+
+    engine = await build_test_engine(tmp_path, {"solo": {
+        "behavior": _fail_from_third_call,
+        "responses": [{"content": "a solid answer"}, {"tool_calls": [_critique_tool_call(True)]}],
+    }})
+
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER2, trace_counterfactual=True))
+
+    # The counterfactual call itself failed, but this is advisory
+    # metadata -- it must never take down an already-produced answer.
+    assert result.answer == "a solid answer"
+    assert result.team == ["solver", "critic", "counterfactual"]
+    assert result.counterfactual.points == []

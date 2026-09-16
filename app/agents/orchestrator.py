@@ -35,10 +35,17 @@ tier-4 team per spec section 十九's own "Very hard" table -- no opt-in
 flag, it just runs: an Advocate and a Skeptic argue for and against the
 tier's draft answer, and a Judge reconciles both into a final,
 strengthened answer that replaces the draft, failing open to the
-untouched draft on any problem. The remaining two Phase 4 pieces
-(Counterfactual/Simulation/Confidence Engine) are deliberately NOT part
-of tier 4 here -- they belong to later steps, and a stub would be fake by
-definition. "Coder" (named
+untouched draft on any problem. Counterfactual (Phase 4's third piece,
+app/intelligence/counterfactual.py) is, like Evidence Graph, opt-in
+(OrchestrationRequest.trace_counterfactual) rather than a spec-named
+standing team member -- but unlike Evidence Graph, it runs at every
+tier including 0-1, since identifying the final answer's own load-bearing
+assumptions needs only the task and the answer, never a DAG. It's pure
+advisory annotation, same as Evidence Graph -- it never revises the
+answer itself, that's Debate's job. The remaining two Phase 4 pieces
+(Simulation/Confidence Engine) are deliberately NOT part of tier 4 here --
+they belong to later steps, and a stub would be fake by definition.
+"Coder" (named
 once in the spec's agents/ listing, never detailed elsewhere) also isn't
 a separate stage: task_type=CODE already gets a quality-biased routing
 policy from the Task Classifier, which is the existing, real behavior
@@ -58,6 +65,7 @@ from typing import TYPE_CHECKING
 
 from app.agents.debate import debate
 from app.agents.synthesizer import synthesize
+from app.contracts.counterfactual import CounterfactualAnalysis
 from app.contracts.dag import DagNodeRequest, DagRunRequest, DagRunResponse
 from app.contracts.debate import DebateResult
 from app.contracts.evidence import EvidenceGraph
@@ -68,6 +76,7 @@ from app.contracts.response import ChatCompletionResponse, extract_message_text
 from app.core.errors import NoAvailableModelError, OrchestrationError
 from app.execution.dag import DagExecutor
 from app.execution.plan_runner import run_plan_with_verification
+from app.intelligence.counterfactual import build_counterfactual_analysis
 from app.intelligence.evidence import build_evidence_graph
 from app.intelligence.task_classifier import classify
 from app.observability.logging import get_logger
@@ -160,6 +169,23 @@ async def _maybe_trace_evidence(
     return evidence
 
 
+async def _maybe_trace_counterfactual(
+    engine: "ChatEngine", request: OrchestrationRequest, answer: str, dag: DagRunResponse | None, team: list[str],
+) -> CounterfactualAnalysis | None:
+    """Builds a Counterfactual analysis for the finished answer when
+    trace_counterfactual was requested. Unlike _maybe_trace_evidence,
+    `dag` may genuinely be None here -- identifying an answer's own
+    load-bearing assumptions never requires a DAG, so this runs at every
+    complexity tier, including 0-1, not just tier >= 2."""
+    if not request.trace_counterfactual:
+        return None
+    analysis = await build_counterfactual_analysis(
+        engine, request.task, answer, context=request.context, dag=dag, routing_policy=request.routing_policy,
+    )
+    team.append("counterfactual")
+    return analysis
+
+
 async def _synthesize_or_fallback(engine: "ChatEngine", request: OrchestrationRequest, dag: DagRunResponse) -> tuple[str, bool]:
     """Returns (answer, used_synthesizer). Raises OrchestrationError if
     every node in the DAG failed -- there is nothing honest to synthesize
@@ -186,9 +212,12 @@ async def orchestrate(engine: "ChatEngine", request: OrchestrationRequest) -> Or
 
     if complexity <= 1:
         response = await _run_solver(engine, request)
+        answer = extract_message_text(response).strip()
+        team = ["solver"]
+        counterfactual = await _maybe_trace_counterfactual(engine, request, answer, None, team)
         return OrchestrationResult(
-            id=new_id("orch"), team=["solver"], complexity=complexity, task_type=task_type,
-            answer=extract_message_text(response).strip(), latency_ms=round((time.time() - start) * 1000, 1),
+            id=new_id("orch"), team=team, complexity=complexity, task_type=task_type,
+            answer=answer, counterfactual=counterfactual, latency_ms=round((time.time() - start) * 1000, 1),
         )
 
     context = await _recall(engine, request)
@@ -201,10 +230,12 @@ async def orchestrate(engine: "ChatEngine", request: OrchestrationRequest) -> Or
         answer = extract_message_text(node.response).strip()
         team = ["solver", "critic"]
         evidence = await _maybe_trace_evidence(engine, request, answer, dag_result, team)
+        counterfactual = await _maybe_trace_counterfactual(engine, request, answer, dag_result, team)
         await _remember(engine, request, answer)
         return OrchestrationResult(
             id=new_id("orch"), team=team, complexity=complexity, task_type=task_type,
-            answer=answer, dag=dag_result, evidence=evidence, latency_ms=round((time.time() - start) * 1000, 1),
+            answer=answer, dag=dag_result, evidence=evidence, counterfactual=counterfactual,
+            latency_ms=round((time.time() - start) * 1000, 1),
         )
 
     verify_tier = complexity >= 4
@@ -238,10 +269,11 @@ async def orchestrate(engine: "ChatEngine", request: OrchestrationRequest) -> Or
             team.append("debate")
 
     evidence = await _maybe_trace_evidence(engine, request, answer, plan_result.dag, team)
+    counterfactual = await _maybe_trace_counterfactual(engine, request, answer, plan_result.dag, team)
     await _remember(engine, request, answer)
 
     return OrchestrationResult(
         id=new_id("orch"), team=team, complexity=complexity, task_type=task_type,
-        answer=answer, dag=plan_result.dag, verification=plan_result.verification, debate=debate_result, evidence=evidence,
-        latency_ms=round((time.time() - start) * 1000, 1),
+        answer=answer, dag=plan_result.dag, verification=plan_result.verification, debate=debate_result,
+        evidence=evidence, counterfactual=counterfactual, latency_ms=round((time.time() - start) * 1000, 1),
     )
