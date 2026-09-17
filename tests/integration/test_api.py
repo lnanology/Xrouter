@@ -104,16 +104,25 @@ def test_admin_benchmark_history_requires_auth(client):
 
 
 def test_admin_benchmark_and_history_are_graceful_with_no_providers_reachable(client):
+    # This suite runs against the real, persistent data/xrouter.sqlite3 (not
+    # a fresh per-test DB), so the benchmarks table may already hold rows
+    # from earlier real usage -- asserting the history comes back empty is
+    # never safe here. Instead assert the real invariant: a benchmark run
+    # with every provider disabled adds no new row, whatever was there
+    # before.
     ctx = app.state.context
     token = ctx.settings.server.admin_token
     _disable_all_providers(client)
+
+    before = client.get("/admin/benchmark/history", headers={"Authorization": f"Bearer {token}"}).json()["benchmarks"]
+
     resp = client.post("/admin/benchmark", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
     assert resp.json()["results"] == []  # no enabled/reachable provider in this environment
 
     resp = client.get("/admin/benchmark/history", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
-    assert resp.json()["benchmarks"] == []
+    assert resp.json()["benchmarks"] == before  # no new row persisted by a no-op run
 
 
 def test_request_body_too_large_rejected(client):
