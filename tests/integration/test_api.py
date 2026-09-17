@@ -106,6 +106,7 @@ def test_admin_benchmark_history_requires_auth(client):
 def test_admin_benchmark_and_history_are_graceful_with_no_providers_reachable(client):
     ctx = app.state.context
     token = ctx.settings.server.admin_token
+    _disable_all_providers(client)
     resp = client.post("/admin/benchmark", headers={"Authorization": f"Bearer {token}"})
     assert resp.status_code == 200
     assert resp.json()["results"] == []  # no enabled/reachable provider in this environment
