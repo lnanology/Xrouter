@@ -593,3 +593,57 @@ async def test_orchestrate_simulate_is_a_noop_when_not_requested(tmp_path):
     assert result.simulations == []
     solo = engine.ctx.providers.get("solo")
     assert solo.call_count == 1
+
+
+# --- orchestrate(): Confidence Engine (Phase 4, last piece) -----------------
+
+@pytest.mark.asyncio
+async def test_orchestrate_tier0_1_confidence_is_the_unreviewed_baseline(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"content": "hello there"}})
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER0))
+
+    assert result.confidence.score == 0.5
+    assert result.confidence.label == "medium"
+    assert result.confidence.reasons == ["unreviewed"]
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_tier2_happy_path_confidence_is_high_with_no_reasons(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"content": "a solid answer"},
+        {"tool_calls": [_critique_tool_call(True)]},
+    ]}})
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER2))
+
+    assert result.confidence.score == 1.0
+    assert result.confidence.label == "high"
+    assert result.confidence.reasons == []
+
+
+@pytest.mark.asyncio
+async def test_orchestrate_tier4_debate_fails_open_confidence_reflects_it(tmp_path):
+    plan_json = [{"id": "solve", "prompt": "answer"}]
+
+    def _fail_from_sixth_call(count: int) -> None:
+        if count >= 6:
+            from app.core.errors import ProviderServerError
+
+            raise ProviderServerError("simulated 500", provider_id="solo")
+
+    engine = await build_test_engine(tmp_path, {"solo": {
+        "behavior": _fail_from_sixth_call,
+        "responses": [
+            {"tool_calls": [_plan_tool_call(plan_json)]},       # 1: plan
+            {"content": "researched answer"},                    # 2: node
+            {"tool_calls": [_critique_tool_call(True)]},          # 3: forced critique
+            {"tool_calls": [_verify_tool_call(True)]},            # 4: verifier, satisfied
+            {"content": "the case for this answer"},              # 5: debate advocate (succeeds)
+            # call 6 (debate skeptic) fails -- the whole debate must roll back
+        ],
+    }})
+
+    result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER4))
+
+    assert result.debate is None
+    assert "debate_failed_open" in result.confidence.reasons
+    assert result.confidence.score < 1.0

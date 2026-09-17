@@ -30,16 +30,18 @@ critic + research + verifier + synthesizer), a standalone Researcher
 (`POST /v1/research`), and Memory/RAG — a real, keyword-based retrieve →
 augment-context → generate loop backed by a persistent, scope-isolated
 memory store, honestly scoped short of semantic search since XRouter has
-no embedding provider or vector store yet. Four pieces of **Phase 4** are
-in too: an Evidence Graph that traces a finished answer's own claims back
-to whichever DAG step actually produced each one, a Debate stage —
+no embedding provider or vector store yet. All five pieces of **Phase 4**
+are in too: an Evidence Graph that traces a finished answer's own claims
+back to whichever DAG step actually produced each one, a Debate stage —
 automatic at tier 4 — where an Advocate and a Skeptic argue for and
 against the draft answer and a Judge reconciles both into a final,
 strengthened one, a Counterfactual analysis that identifies an answer's
 own load-bearing assumptions and how the answer would change if each one
-didn't hold, and Simulation, which actually re-answers the task under a
+didn't hold, Simulation, which actually re-answers the task under a
 caller-supplied changed premise instead of just guessing what would
-happen.
+happen, and a Confidence Engine that rolls up whichever of those signals
+a run actually produced into one free, automatic confidence score on
+every response.
 
 ## Quick start
 
@@ -453,6 +455,7 @@ curl http://localhost:20128/v1/agents/run \
   "evidence": { "...": "set only when trace_evidence was requested" },
   "counterfactual": { "...": "set only when trace_counterfactual was requested" },
   "simulations": [{ "...": "one entry per scenario in `simulate` that actually produced an answer" }],
+  "confidence": { "score": 1.0, "label": "high", "reasons": [] },
   "latency_ms": 2140.7
 }
 ```
@@ -480,7 +483,7 @@ used. The tiers, straight from the routing table in the spec:
   forced, since forcing a tool call a task doesn't actually need would be
   exactly the "fake placeholder functionality" the project's rules forbid.
 
-Four of Phase 4's five pieces are wired in on top of these tiers — see
+All five of Phase 4's pieces are wired in on top of these tiers — see
 their own sections below for the full reasoning. Debate is the one
 exception to "`team` only reflects what a tier actually ran, nothing
 opt-in by default": it's a spec-named *standing* member of the tier-4
@@ -488,12 +491,14 @@ team (section 十九's own "very hard" table lists it right next to
 Verification), so it runs automatically whenever complexity reaches tier
 4, no flag required. Evidence Graph, Counterfactual, and Simulation are
 all opt-in (`trace_evidence` / `trace_counterfactual` / `simulate`) since
-none of the three is named in that table. Confidence Engine is the one
-Phase 4 piece still unbuilt — a stub here would be fake by definition, so
-it simply isn't part of any tier yet. "Coder" also isn't a separate
-stage: `task_type: code` already gets a quality-biased routing policy
-from the Task Classifier, which is the existing, real behavior this
-module reuses rather than duplicating.
+none of the three is named in that table. Confidence Engine is neither
+opt-in nor a `team`-list entry: it makes zero provider calls, so it just
+runs automatically on every response at every tier, rolling up whichever
+of `dag`/`verification`/`debate`/`evidence` a run actually produced into
+`confidence`. "Coder" also isn't a separate stage: `task_type: code`
+already gets a quality-biased routing policy from the Task Classifier,
+which is the existing, real behavior this module reuses rather than
+duplicating.
 Response codes mirror the pieces it's built from: `503` if no provider
 could even answer (nothing to report yet), `422` if the Planner exhausted
 every retry, `503` (`OrchestrationError`) if a whole DAG's worth of steps
@@ -774,6 +779,47 @@ least one scenario actually produced a result — there's no honest
 "attempted but empty" state the way an LLM judgment can legitimately
 return zero claims/points; an entirely-failed batch just didn't run.
 
+### Confidence Engine (Phase 4, last piece — always on, no flag)
+
+The fifth and last piece of Phase 4: `app/intelligence/confidence.py`
+rolls up everything a finished Orchestrator run already observed about
+its own answer — which layers of scrutiny actually ran, and whether each
+one that ran was satisfied — into one deterministic confidence score.
+Unlike every other Phase 4 piece, it isn't opt-in and it isn't a
+`team`-list entry, because it isn't another LLM judgment: it never spends
+a provider call and never re-reads response text, it only combines
+structured results (`dag`, `verification`, `debate`, `evidence`) the run
+already produced for other reasons. Since it costs nothing extra, gating
+it behind a flag would be arbitrary, so `confidence` is a required field
+on every `OrchestrationResult`, at every tier, including 0-1:
+
+```json
+{
+  "...": "the rest of the OrchestrationResult",
+  "confidence": {
+    "score": 0.7,
+    "label": "medium",
+    "reasons": ["critique_unsatisfied"]
+  }
+}
+```
+
+At tier 0-1, nothing ever reviewed the answer (no DAG ran at all), so
+`confidence` reports an honest neutral baseline — `score: 0.5`, `label:
+"medium"`, `reasons: ["unreviewed"]` — rather than guessing. From tier ≥
+2 on, it starts at a perfect `1.0` and subtracts a fixed penalty for each
+concretely observed problem — the DAG finishing `"partial"` rather than
+`"success"`, any node's Critic judgment coming back unsatisfied, a
+`VerificationResult` coming back unsatisfied, Debate having been due
+(the run reached tier 4) but failing open with no result, and — when
+Evidence Graph ran — a share of claims judged unsupported, scaled by
+their ratio of the total — clamping to `[0.0, 1.0]` and labeling `"high"`
+(≥ 0.8), `"medium"` (≥ 0.5), or `"low"` otherwise. Same "start at 1.0,
+subtract concrete penalties, clamp, round" shape the pre-existing Quality
+Gate (`app/intelligence/quality_gate.py`, Phase 2) already uses for its
+own, differently-scoped, single-response structural check — see that
+module's own docstring for the full division between the two.
+
 ## Tests
 
 ```bash
@@ -781,7 +827,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-325 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+343 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -942,7 +988,21 @@ batch returning an empty list rather than raising, and — end-to-end
 through the Orchestrator — `simulate` genuinely running at tier 0-1 (same
 proof point as Counterfactual), a tier-2 run with two scenarios, and
 `"simulation"` only appearing in `team` when at least one scenario
-actually produced a result.
+actually produced a result. Confidence Engine
+(`tests/execution/test_confidence.py`, `tests/agents/test_orchestrator.py`)
+— pure unit tests on `assess_confidence` itself: the tier-0-1 `dag=None`
+baseline, a clean run scoring a perfect `1.0`/`"high"` with no reasons,
+each of the five penalties triggering in isolation (dag partial, critique
+unsatisfied, verification unsatisfied, debate failed open — and
+confirming it's *not* penalized when no verifier ran, or when a debate
+result is actually present — and unsupported claims scaled by their
+ratio, including an empty/fully-supported claims list never penalizing),
+multiple penalties stacking and clamping to `0.0` rather than going
+negative, all three label boundaries, and — end-to-end through the
+Orchestrator — the tier-0-1 unreviewed baseline, a tier-2 happy path
+scoring `1.0`, and reusing the tier-4 debate-fails-open scenario to
+confirm `confidence.reasons` actually includes `"debate_failed_open"`
+there.
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -951,7 +1011,7 @@ reachable" tests now explicitly disable every provider rather than relying
 on the host having none installed, and the cache fixture uses
 `asyncio.run()` instead of the now-removed implicit-event-loop fallback).
 
-## What's implemented (Phase 1 + Phase 2 + Phase 3 + partial Phase 4)
+## What's implemented (Phase 1 + Phase 2 + Phase 3 + Phase 4)
 
 **Phase 1:** FastAPI gateway · OpenAI-compatible `/v1/models` +
 `/v1/chat/completions` (incl. `stream=true`) · Provider adapter interface +
@@ -1080,7 +1140,7 @@ and written after every Orchestrator run at tier ≥ 2 — see the Memory/RAG
 section above for why keyword retrieval, not a faked-up "semantic"
 search, is what ships first.
 
-**Phase 4 (so far):** Evidence Graph (`app/intelligence/evidence.py`,
+**Phase 4:** Evidence Graph (`app/intelligence/evidence.py`,
 `app/contracts/evidence.py`) — opt-in (`OrchestrationRequest.trace_evidence`)
 tracing of a finished Orchestrator answer's own claims back to whichever
 DAG step actually produced each one, also a forced tool call
@@ -1128,13 +1188,25 @@ reasoning. Capped at 3 scenarios per request, and like Counterfactual
 runs at every tier including 0-1. Fails open **per scenario** rather than
 as a whole batch, since scenarios are independent; `"simulation"` is only
 added to `team` when at least one scenario actually produced a result.
+Confidence Engine (`app/intelligence/confidence.py`,
+`app/contracts/confidence.py`) — the fifth and last piece: a synchronous,
+zero-cost roll-up of whichever of `dag`/`verification`/`debate`/`evidence`
+a run actually produced into one deterministic `ConfidenceAssessment`,
+never a second LLM judgment and never gated behind a flag since it spends
+nothing extra — required on every `OrchestrationResult`, at every tier
+including 0-1, where it reports a neutral `"unreviewed"` baseline rather
+than guessing. Deliberately distinguished from the pre-existing Quality
+Gate (`app/intelligence/quality_gate.py`, Phase 2), which judges a single
+response's own text for structural defects and can trigger a retry — see
+the Confidence Engine section above and that module's own docstring for
+the full division.
 
-## What's not implemented yet (by design — see Phase 4-5 in the spec)
+## What's not implemented yet (by design — see Phase 5 in the spec)
 
-The last piece of Phase 4 (Confidence Engine — Evidence Graph, Debate,
-Counterfactual and Simulation are done, see above) and all of Phase 5
-(Evolution Engine, A/B Routing, Policy Learning, Self-healing, Automated
-Benchmark) haven't started; being built one piece at a time, in that
+Phase 4 is fully done (Evidence Graph, Debate, Counterfactual, Simulation,
+Confidence Engine — see above). Phase 5 (Evolution Engine, A/B Routing,
+Policy Learning, Self-healing, Automated Benchmark) hasn't started; being
+built one piece at a time, in that
 order, each with its own review checkpoint. Also still open: other tool
 types beyond
 `web_search`, multi-turn agent loops,
@@ -1148,7 +1220,7 @@ the quality gate (both above only cover non-streaming requests — a
 streamed response has already reached the client chunk by chunk by the
 time either could act on it). Their directories exist as reserved, empty
 packages (`app/execution/cancellation.py`, `app/network`, `app/plugins`)
-so the rest of Phase 4+ has a home without restructuring what's already
+so the rest of Phase 5+ has a home without restructuring what's already
 built.
 
 ## Project layout

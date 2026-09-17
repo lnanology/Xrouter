@@ -19,7 +19,14 @@ callers can see what happened.
 Non-streaming only: a streamed response has already been sent to the
 client chunk by chunk by the time it could be assessed, so there is
 nothing left to retry (same reasoning as the first-chunk-only fallback
-boundary in app/routing/fallback.py's run_stream_chat)."""
+boundary in app/routing/fallback.py's run_stream_chat).
+
+Distinct from the later, differently-scoped Confidence Engine
+(app/intelligence/confidence.py, Phase 4's last piece): that module never
+re-reads response text itself, it rolls up an already-finished
+Orchestrator run's own higher-level signals (Critic/Verifier/Debate/
+Evidence Graph outcomes) into one confidence score, with no extra
+provider call and no retry of its own."""
 from __future__ import annotations
 
 from collections import Counter

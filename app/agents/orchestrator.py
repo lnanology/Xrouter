@@ -48,9 +48,13 @@ a caller-supplied list of changed-premise scenarios), and also runs at
 every tier including 0-1 for the same "doesn't need a DAG" reason -- but
 unlike Counterfactual, which guesses how the answer would change,
 Simulation actually re-answers the task once per scenario, a genuine
-re-execution rather than a judgment. The last Phase 4 piece (Confidence
-Engine) is deliberately NOT part of tier 4 here -- it belongs to a later
-step, and a stub would be fake by definition. "Coder" (named
+re-execution rather than a judgment. Confidence Engine (Phase 4's fifth
+and last piece, app/intelligence/confidence.py) closes Phase 4 out: unlike
+every piece above, it is neither opt-in nor a standing team member with
+its own team-list entry -- it makes zero provider calls, so it just runs
+automatically on every OrchestrationResult, at every tier, rolling up
+whichever of dag/verification/debate/evidence signals this run actually
+produced into one deterministic confidence score. "Coder" (named
 once in the spec's agents/ listing, never detailed elsewhere) also isn't
 a separate stage: task_type=CODE already gets a quality-biased routing
 policy from the Task Classifier, which is the existing, real behavior
@@ -71,6 +75,7 @@ from typing import TYPE_CHECKING
 from app.agents.debate import debate
 from app.agents.simulation import run_simulations
 from app.agents.synthesizer import synthesize
+from app.contracts.confidence import ConfidenceAssessment
 from app.contracts.counterfactual import CounterfactualAnalysis
 from app.contracts.dag import DagNodeRequest, DagRunRequest, DagRunResponse
 from app.contracts.debate import DebateResult
@@ -83,6 +88,7 @@ from app.contracts.simulation import SimulationRun
 from app.core.errors import NoAvailableModelError, OrchestrationError
 from app.execution.dag import DagExecutor
 from app.execution.plan_runner import run_plan_with_verification
+from app.intelligence.confidence import assess_confidence
 from app.intelligence.counterfactual import build_counterfactual_analysis
 from app.intelligence.evidence import build_evidence_graph
 from app.intelligence.task_classifier import classify
@@ -242,9 +248,10 @@ async def orchestrate(engine: "ChatEngine", request: OrchestrationRequest) -> Or
         team = ["solver"]
         counterfactual = await _maybe_trace_counterfactual(engine, request, answer, None, team)
         simulations = await _maybe_run_simulations(engine, request, team)
+        confidence = assess_confidence(team)
         return OrchestrationResult(
             id=new_id("orch"), team=team, complexity=complexity, task_type=task_type,
-            answer=answer, counterfactual=counterfactual, simulations=simulations,
+            answer=answer, counterfactual=counterfactual, simulations=simulations, confidence=confidence,
             latency_ms=round((time.time() - start) * 1000, 1),
         )
 
@@ -261,10 +268,11 @@ async def orchestrate(engine: "ChatEngine", request: OrchestrationRequest) -> Or
         counterfactual = await _maybe_trace_counterfactual(engine, request, answer, dag_result, team)
         simulations = await _maybe_run_simulations(engine, request, team)
         await _remember(engine, request, answer)
+        confidence = assess_confidence(team, dag=dag_result)
         return OrchestrationResult(
             id=new_id("orch"), team=team, complexity=complexity, task_type=task_type,
             answer=answer, dag=dag_result, evidence=evidence, counterfactual=counterfactual, simulations=simulations,
-            latency_ms=round((time.time() - start) * 1000, 1),
+            confidence=confidence, latency_ms=round((time.time() - start) * 1000, 1),
         )
 
     verify_tier = complexity >= 4
@@ -301,10 +309,13 @@ async def orchestrate(engine: "ChatEngine", request: OrchestrationRequest) -> Or
     counterfactual = await _maybe_trace_counterfactual(engine, request, answer, plan_result.dag, team)
     simulations = await _maybe_run_simulations(engine, request, team)
     await _remember(engine, request, answer)
+    confidence = assess_confidence(
+        team, dag=plan_result.dag, verification=plan_result.verification, debate=debate_result, evidence=evidence,
+    )
 
     return OrchestrationResult(
         id=new_id("orch"), team=team, complexity=complexity, task_type=task_type,
         answer=answer, dag=plan_result.dag, verification=plan_result.verification, debate=debate_result,
         evidence=evidence, counterfactual=counterfactual, simulations=simulations,
-        latency_ms=round((time.time() - start) * 1000, 1),
+        confidence=confidence, latency_ms=round((time.time() - start) * 1000, 1),
     )

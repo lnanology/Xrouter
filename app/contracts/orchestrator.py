@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from pydantic import BaseModel, Field
 
+from app.contracts.confidence import ConfidenceAssessment
 from app.contracts.counterfactual import CounterfactualAnalysis
 from app.contracts.dag import DagRunResponse
 from app.contracts.debate import DebateResult
@@ -57,4 +58,11 @@ class OrchestrationResult(BaseModel):
     evidence: EvidenceGraph | None = None  # set only when trace_evidence was requested and a DAG actually ran
     counterfactual: CounterfactualAnalysis | None = None  # set only when trace_counterfactual was requested -- unlike evidence, can be set at any tier
     simulations: list[SimulationRun] = Field(default_factory=list)  # one entry per scenario in `simulate` that actually produced an answer
+    # Confidence Engine (Phase 4's last piece, app/intelligence/
+    # confidence.py): unlike evidence/counterfactual/simulations above,
+    # this is never Optional/empty-by-default -- it costs no extra
+    # provider call, so it's computed for every run, at every tier,
+    # including 0-1 (where it reports a neutral "unreviewed" baseline
+    # rather than guessing).
+    confidence: ConfidenceAssessment
     latency_ms: float
