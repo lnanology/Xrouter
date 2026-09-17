@@ -42,3 +42,16 @@ ab_routing:
   variants:
     - quality
     - balanced
+
+# Policy Learning (Phase 5): off by default -- enabling this lets the
+# router use weights nudged by PolicyLearner.run_once() instead of the
+# static defaults in app/routing/policies/*.py (same reasoning as
+# ab_routing.enabled). Depends on ab_routing already being enabled and
+# trafficked -- with no ab_results data there's nothing to learn from.
+policy_learning:
+  enabled: false
+  min_samples: 20
+  learning_rate: 0.15
+  min_margin: 0.05
+  latency_weight_per_second: 0.05
+  quality_weight: 0.1

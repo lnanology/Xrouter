@@ -75,6 +75,23 @@ async def admin_ab_routing_summary(request: Request):
     }
 
 
+@router.get("/policy_learning/weights", dependencies=[Depends(require_admin)])
+async def admin_policy_learning_weights(request: Request):
+    """Current learned state -- see PolicyLearner.snapshot()."""
+    ctx = request.app.state.context
+    return ctx.policy_learner.snapshot()
+
+
+@router.post("/policy_learning/relearn", dependencies=[Depends(require_admin)])
+async def admin_policy_learning_relearn(request: Request):
+    """Manually triggers one PolicyLearner.run_once() cycle, regardless of
+    whether policy_learning.enabled gates the router from actually using
+    the result -- same "manual trigger works independent of the schedule
+    switch" precedent as POST /admin/benchmark."""
+    ctx = request.app.state.context
+    return await ctx.policy_learner.run_once()
+
+
 @router.post("/reload", dependencies=[Depends(require_admin)])
 async def admin_reload(request: Request):
     ctx = request.app.state.context

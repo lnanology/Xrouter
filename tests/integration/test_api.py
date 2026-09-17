@@ -148,6 +148,43 @@ def test_admin_ab_routing_summary_reports_the_real_running_config(client):
     assert isinstance(body["results"], dict)
 
 
+def test_admin_policy_learning_weights_requires_auth(client):
+    resp = client.get("/admin/policy_learning/weights")
+    assert resp.status_code == 401
+
+
+def test_admin_policy_learning_relearn_requires_auth(client):
+    resp = client.post("/admin/policy_learning/relearn")
+    assert resp.status_code == 401
+
+
+def test_admin_policy_learning_weights_reports_the_real_running_config(client):
+    # policy_learning is off by default. Same lesson as the ab_routing
+    # summary test above: this suite runs against the real, persistent
+    # data/xrouter.sqlite3, so learned_overrides may already hold entries
+    # from an earlier run -- never assert it's empty, only that the shape
+    # and the enabled/variants fields match the real running Settings.
+    ctx = app.state.context
+    token = ctx.settings.server.admin_token
+    resp = client.get("/admin/policy_learning/weights", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["enabled"] == ctx.settings.policy_learning.enabled
+    assert body["variants"] == ctx.settings.ab_routing.variants
+    assert isinstance(body["learned_overrides"], dict)
+
+
+def test_admin_policy_learning_relearn_is_graceful_regardless_of_data(client):
+    # A manual relearn must always return 200 with an "applied" key,
+    # whether or not there's enough real ab_results data to act on -- never
+    # erroring, and never assuming a specific outcome either way.
+    ctx = app.state.context
+    token = ctx.settings.server.admin_token
+    resp = client.post("/admin/policy_learning/relearn", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert "applied" in resp.json()
+
+
 def test_request_body_too_large_rejected(client):
     from app.core.config import get_settings
 

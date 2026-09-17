@@ -15,9 +15,12 @@ from app.reliability.circuit_breaker import CircuitBreakerRegistry
 from app.routing import policies as _policies_pkg  # noqa: F401  (documents location)
 from app.routing.performance_controller import PerformanceController
 from app.routing.policies import balanced, cheapest, fastest, quality, quota_aware, reliable
+from app.routing.policy_learner import PolicyLearner
 from app.routing.scorer import ScoreInput, score_candidate
 
-_POLICY_WEIGHTS: dict[str, PolicyWeights] = {
+# Public: app/routing/policy_learner.py reads this as the base weights a
+# learned override is nudged from/toward.
+POLICY_WEIGHTS: dict[str, PolicyWeights] = {
     "balanced": balanced.WEIGHTS,
     "fastest": fastest.WEIGHTS,
     "cheapest": cheapest.WEIGHTS,
@@ -38,6 +41,7 @@ class AdaptiveRouter:
         quota_tracker: QuotaTracker,
         default_policy: str = "balanced",
         performance_controller: PerformanceController | None = None,
+        policy_learner: PolicyLearner | None = None,
     ):
         self._providers = provider_registry
         self._models = model_registry
@@ -47,10 +51,17 @@ class AdaptiveRouter:
         # Optional: a router built without one (e.g. in unit tests) simply
         # never applies a performance weight — every candidate stays neutral.
         self._performance = performance_controller
+        # Optional: a router built without one (e.g. in unit tests) simply
+        # never applies a learned override — every policy stays at its
+        # static base weights, the same "no collaborator = neutral" shape
+        # performance_controller already uses.
+        self._policy_learner = policy_learner
 
     def resolve_policy(self, name: str | None) -> tuple[str, PolicyWeights]:
         key = (name or self._default_policy).lower()
-        return key, _POLICY_WEIGHTS.get(key, _POLICY_WEIGHTS["balanced"])
+        base = POLICY_WEIGHTS.get(key, POLICY_WEIGHTS["balanced"])
+        weights = self._policy_learner.weights_for(key, base) if self._policy_learner else base
+        return key, weights
 
     def _requested_model_filter(self, requested: str) -> str | None:
         """If the client asked for a specific known public_id

@@ -138,12 +138,32 @@ class ABRoutingConfig:
 
 
 @dataclass
+class PolicyLearningConfig:
+    """Policy Learning (Phase 5's third piece, section 三十六): off by
+    default. Like A/B Routing, turning this on changes how live traffic
+    gets scored -- app/routing/router.py's resolve_policy starts returning
+    nudged weights instead of the static defaults -- so it gets the same
+    "must not turn on silently" default as everything else in this family.
+    Depends on A/B Routing already being enabled and trafficked: with no
+    ab_results data, PolicyLearner.run_once() just reports
+    insufficient_samples every time -- an expected consequence of the
+    dependency, not a bug. See app/routing/policy_learner.py."""
+    enabled: bool = False
+    min_samples: int = 20
+    learning_rate: float = 0.15
+    min_margin: float = 0.05
+    latency_weight_per_second: float = 0.05
+    quality_weight: float = 0.1
+
+
+@dataclass
 class Settings:
     server: ServerConfig
     routing: RoutingConfig
     cache: CacheConfig
     benchmark: BenchmarkConfig
     ab_routing: ABRoutingConfig
+    policy_learning: PolicyLearningConfig
     providers: dict[str, ProviderConfig]
     raw_routing: dict[str, Any]
     model_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -213,6 +233,16 @@ class Settings:
             variants=ab_routing_raw.get("variants", ABRoutingConfig().variants),
         )
 
+        policy_learning_raw = raw_config.get("policy_learning", {})
+        policy_learning = PolicyLearningConfig(
+            enabled=bool(policy_learning_raw.get("enabled", False)),
+            min_samples=int(policy_learning_raw.get("min_samples", 20)),
+            learning_rate=float(policy_learning_raw.get("learning_rate", 0.15)),
+            min_margin=float(policy_learning_raw.get("min_margin", 0.05)),
+            latency_weight_per_second=float(policy_learning_raw.get("latency_weight_per_second", 0.05)),
+            quality_weight=float(policy_learning_raw.get("quality_weight", 0.1)),
+        )
+
         providers: dict[str, ProviderConfig] = {}
         for pid, pcfg in (raw_providers.get("providers") or {}).items():
             providers[pid] = ProviderConfig(
@@ -250,7 +280,8 @@ class Settings:
 
         return cls(
             server=server, routing=routing, cache=cache, benchmark=benchmark, ab_routing=ab_routing,
-            providers=providers, raw_routing=raw_routing, model_overrides=model_overrides, tools=tools,
+            policy_learning=policy_learning, providers=providers, raw_routing=raw_routing,
+            model_overrides=model_overrides, tools=tools,
         )
 
 

@@ -1,12 +1,13 @@
 import pytest
 
+from app.contracts.policy import PolicyWeights
 from app.contracts.provider import ProviderConfig, ProviderHealth, ProviderStatus
 from app.contracts.request import ChatCompletionRequest, ChatMessage
 from app.core.errors import NoAvailableModelError
 from app.core.registry import ModelRegistry, ProviderRegistry
 from app.quota.tracker import QuotaTracker
 from app.reliability.circuit_breaker import CircuitBreakerRegistry, CircuitState
-from app.routing.router import AdaptiveRouter
+from app.routing.router import POLICY_WEIGHTS, AdaptiveRouter
 from tests.helpers import FakeProvider, make_model
 
 
@@ -87,6 +88,51 @@ def test_local_preference_biases_toward_local():
     router, *_ = _build({"ollama": [local], "cloudp": [cloud]}, local_ids={"ollama"})
     decision = router.select(_req(), "cheapest")
     assert decision.primary.provider_id == "ollama"
+
+
+class _StubPolicyLearner:
+    """Minimal stand-in for PolicyLearner exposing only the one method
+    AdaptiveRouter.resolve_policy actually calls -- lets these tests assert
+    the injection point in isolation from PolicyLearner's own learning
+    logic (covered separately in tests/routing/test_policy_learner.py)."""
+
+    def __init__(self, overrides: dict[str, PolicyWeights]):
+        self._overrides = overrides
+
+    def weights_for(self, policy_key: str, base: PolicyWeights) -> PolicyWeights:
+        return self._overrides.get(policy_key, base)
+
+
+def test_resolve_policy_uses_learned_override_when_present():
+    override = PolicyWeights(quality=9.0, speed=9.0, reliability=9.0, cost=9.0, quota_risk=9.0, local_preference=9.0)
+    router, *_ = _build({})
+    router._policy_learner = _StubPolicyLearner({"quality": override})
+
+    key, weights = router.resolve_policy("quality")
+
+    assert key == "quality"
+    assert weights is override
+
+
+def test_resolve_policy_falls_back_to_base_weights_for_untouched_policy():
+    override = PolicyWeights(quality=9.0)
+    router, *_ = _build({})
+    router._policy_learner = _StubPolicyLearner({"quality": override})
+
+    key, weights = router.resolve_policy("balanced")
+
+    assert key == "balanced"
+    assert weights is POLICY_WEIGHTS["balanced"]
+
+
+def test_resolve_policy_with_no_policy_learner_uses_base_weights():
+    router, *_ = _build({})
+    assert router._policy_learner is None  # existing construction path, unchanged
+
+    key, weights = router.resolve_policy("cheapest")
+
+    assert key == "cheapest"
+    assert weights is POLICY_WEIGHTS["cheapest"]
 
 
 def test_fallback_chain_ordered_by_score():

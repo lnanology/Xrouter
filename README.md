@@ -942,6 +942,72 @@ silently" reasoning already applied to `routing.race_mode_enabled`,
 how every non-pinned request already being served gets routed, not just an
 extra background call.
 
+### Policy Learning (Phase 5, opt-in: `policy_learning.enabled` in `config.yaml`)
+
+Phase 5's third piece. Reads A/B Routing's own `ab_results` data (A/B
+variant names are literally routing-policy names, e.g. `"quality"` vs
+`"balanced"`) and nudges the *losing* policy's weights a step toward the
+*winning* policy's weights, so a policy demonstrably underperforming in
+real traffic gradually converges toward one that's winning — real
+learning from real outcomes, scoped honestly: `PolicyLearner.run_once()`
+computes one deterministic adjustment step, it is **not** a scheduled
+background loop and **not** a real ML model. The repeated scheduling is
+Evolution Engine's job (the next piece, described in this same README as
+"a loop that repeatedly runs A/B Routing ... and feeds the result into
+Policy Learning") — building a second competing scheduler here would be
+exactly the unneeded infrastructure this project's own rules forbid.
+
+Each eligible variant (one of `ab_routing.variants` with at least
+`policy_learning.min_samples` recorded outcomes) gets one transparent
+fitness score:
+
+```
+fitness = success_rate + quality_weight * avg_quality_score - latency_weight_per_second * (avg_latency_ms / 1000)
+```
+
+`success_rate` (in `[0, 1]`) dominates by construction; latency and
+quality are small, explicitly-weighted tie-breakers, not hidden
+heuristics. The variant with the highest fitness is the winner; every
+other eligible variant gets nudged toward it **only if** the fitness gap
+clears `policy_learning.min_margin` — a gap that small is treated as
+statistically indistinguishable, so weights aren't churned on noise. The
+nudge moves every one of `PolicyWeights`' 6 dimensions by
+`learning_rate * (winner - current)`, clamped to `[0.05, 5.0]` as a safety
+net against runaway drift, and compounds: a second `run_once()` nudges
+from the *already-learned* weights, not the original static constants, so
+repeated calls converge toward whatever's currently winning.
+
+`AdaptiveRouter.resolve_policy` — the one place every request's weights
+were already being looked up — is where this plugs in: `PolicyLearner.
+weights_for(key, base)` returns the learned override when enabled and one
+exists, otherwise the static base weights, unchanged. Disabled is a
+complete no-op for real routing (same precedent as `ABRouter.assign()`),
+even though a manual relearn can still compute and store a preview while
+disabled — it's the read path, not the compute path, that's gated.
+
+```bash
+curl -X POST http://localhost:20128/admin/policy_learning/relearn -H "Authorization: Bearer $TOKEN"
+curl "http://localhost:20128/admin/policy_learning/weights" -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{ "enabled": true, "variants": ["quality", "balanced"],
+  "learned_overrides": {
+    "balanced": { "quality": 1.225, "speed": 0.925, "reliability": 1.03, "cost": 0.895, "quota_risk": 0.97, "local_preference": 0.94 }
+  } }
+```
+
+Off by default (`policy_learning.enabled: false`) — the same "must not
+turn on silently" reasoning as everywhere else in this family, since this
+changes how live traffic gets scored. It also has a real dependency on
+A/B Routing already being enabled and trafficked: with no `ab_results`
+data, `run_once()` just reports `insufficient_samples` every time — an
+expected consequence of the dependency chain, not a bug in this piece.
+Learned overrides live in memory only (process-lifetime, not persisted to
+a table) in this first version — if Evolution Engine later needs them to
+survive a restart, that's its own extension point, not built ahead of
+need.
+
 ## Tests
 
 ```bash
@@ -949,7 +1015,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-367 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+385 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -1157,7 +1223,31 @@ no-op, an enabled config assigning a variant/tagging
 hit never recording a second outcome for the same sticky user, and, full
 stack, `GET /admin/ab_routing/summary` requiring the same admin token as
 every other `/admin/*` route and reporting the real running
-`enabled`/`variants` config.
+`enabled`/`variants` config. Policy Learning
+(`tests/routing/test_policy_learner.py`, `tests/routing/test_router.py`,
+`tests/integration/test_api.py`) — `_nudge`/`_clamp` in isolation: moving
+every `PolicyWeights` dimension by exactly `learning_rate * (target -
+current)`, and clamping an intentionally extreme target to
+`[0.05, 5.0]`; `weights_for()` returning the untouched base weights both
+when disabled (even with a stored override present) and when no override
+has been learned yet for that key; `run_once()` reporting
+`insufficient_samples` (and touching no state) below `min_samples`,
+nudging a clear loser toward the winner by the exact expected amount on
+every dimension, skipping a loser whose fitness gap doesn't clear
+`min_margin` (an exact tie), a 3-variant case nudging only the one
+pairing that clears the margin and leaving the other untouched, and
+repeated calls compounding from the previous call's already-learned
+weights rather than the original constants; `snapshot()`'s shape before
+and after learning; and, in `AdaptiveRouter` itself, `resolve_policy`
+returning a stubbed learner's override for a matching policy key while
+still falling back to the base constant for any key the learner hasn't
+touched, and every pre-existing router test continuing to pass unchanged
+with no `policy_learner` supplied at all; and, full stack, both new
+`/admin/policy_learning/*` routes requiring the same admin token as every
+other `/admin/*` route, `GET .../weights` reporting the real running
+`enabled`/`variants` config, and `POST .../relearn` always returning 200
+with an `applied` key present regardless of how much real data exists to
+act on.
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -1378,11 +1468,22 @@ comparative outcome tagged by variant over `GET
 Policy Learning (the next piece) will have anything to learn from. See
 the A/B Routing section above for the full design, including how it
 differs from race mode and why cache hits never record an outcome.
+Policy Learning (`app/routing/policy_learner.py`, `app/routing/router.py`,
+`app/api/admin.py`) — the third piece. Reads A/B Routing's own
+`ab_results` and nudges a losing policy's weights a step toward the
+winning policy's weights via one deterministic, documented fitness
+formula — not a scheduled loop and not a real ML model; the repeated
+scheduling is deliberately left to Evolution Engine (the next piece).
+Plugs into the one existing weights-lookup point,
+`AdaptiveRouter.resolve_policy`, off by default, over `GET/POST
+/admin/policy_learning/{weights,relearn}`. See the Policy Learning section
+above for the full fitness/nudge design and its honest dependency on A/B
+Routing already being enabled and trafficked.
 
 ## What's not implemented yet (by design — see Phase 5 in the spec)
 
-Three of Phase 5's five pieces remain: Policy Learning, Evolution Engine,
-and Self-healing (Automated Benchmark and A/B Routing are done, see
+Two of Phase 5's five pieces remain: Evolution Engine and Self-healing
+(Automated Benchmark, A/B Routing, and Policy Learning are done, see
 above) — being built one piece at a time, in the dependency order
 explained above, each with its own review checkpoint. Also still open:
 other tool types beyond

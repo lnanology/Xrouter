@@ -16,6 +16,7 @@ from app.reliability.circuit_breaker import CircuitBreakerRegistry
 from app.reliability.health import HealthMonitor
 from app.routing.ab_router import ABRouter
 from app.routing.performance_controller import PerformanceController
+from app.routing.policy_learner import PolicyLearner
 from app.routing.router import AdaptiveRouter
 from app.routing.scheduler import ConcurrencyLimiter
 from app.storage.database import Database
@@ -60,9 +61,18 @@ async def startup(settings: Settings | None = None) -> AppContext:
     performance = PerformanceController(metrics_repo=metrics_repo, events=events, snapshot_interval_seconds=60.0)
     performance.start()
 
+    policy_learner = PolicyLearner(
+        settings.ab_routing.variants, metrics_repo, enabled=settings.policy_learning.enabled,
+        min_samples=settings.policy_learning.min_samples, learning_rate=settings.policy_learning.learning_rate,
+        min_margin=settings.policy_learning.min_margin,
+        latency_weight_per_second=settings.policy_learning.latency_weight_per_second,
+        quality_weight=settings.policy_learning.quality_weight,
+    )
+
     router = AdaptiveRouter(
         providers, models, circuits, quota,
         default_policy=settings.routing.default_policy, performance_controller=performance,
+        policy_learner=policy_learner,
     )
     cache = CacheManager(settings.cache, db_path)
 
@@ -97,6 +107,7 @@ async def startup(settings: Settings | None = None) -> AppContext:
         provider_repo=provider_repo, model_repo=model_repo, request_repo=request_repo,
         metrics_repo=metrics_repo, health_monitor=health_monitor, performance=performance, tools=tools,
         memory_repo=memory_repo, benchmark_scheduler=benchmark_scheduler, ab_router=ab_router,
+        policy_learner=policy_learner,
     )
 
 

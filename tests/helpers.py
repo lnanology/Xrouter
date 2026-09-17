@@ -171,7 +171,8 @@ class FakeTool:
 
 async def build_test_engine(
     tmp_path, provider_specs: dict[str, dict], tool_specs: dict[str, dict] | None = None,
-    ab_routing_overrides: dict | None = None, **routing_overrides,
+    ab_routing_overrides: dict | None = None, policy_learning_overrides: dict | None = None,
+    **routing_overrides,
 ):
     """Assembles a real ChatEngine wired to FakeProviders instead of real
     adapters — the same pieces app.core.lifecycle.startup() assembles into
@@ -191,9 +192,14 @@ async def build_test_engine(
     unless they override it.
     ab_routing_overrides: passed straight through to ABRoutingConfig;
     defaults to a disabled ABRouter (matching production's own default)
-    unless a test opts in with e.g. {"enabled": True, "variants": [...]}."""
+    unless a test opts in with e.g. {"enabled": True, "variants": [...]}.
+    policy_learning_overrides: passed straight through to
+    PolicyLearningConfig; defaults to a disabled PolicyLearner (matching
+    production's own default) unless a test opts in."""
     from app.cache.manager import CacheManager
-    from app.core.config import ABRoutingConfig, BenchmarkConfig, CacheConfig, RoutingConfig, ServerConfig, Settings
+    from app.core.config import (
+        ABRoutingConfig, BenchmarkConfig, CacheConfig, PolicyLearningConfig, RoutingConfig, ServerConfig, Settings,
+    )
     from app.core.context import AppContext
     from app.core.engine import ChatEngine
     from app.core.registry import ModelRegistry, ProviderRegistry
@@ -202,6 +208,7 @@ async def build_test_engine(
     from app.quota.tracker import QuotaTracker
     from app.reliability.circuit_breaker import CircuitBreakerRegistry
     from app.routing.ab_router import ABRouter
+    from app.routing.policy_learner import PolicyLearner
     from app.routing.router import AdaptiveRouter
     from app.routing.scheduler import ConcurrencyLimiter
     from app.storage.database import Database
@@ -240,14 +247,23 @@ async def build_test_engine(
     routing_defaults.update(routing_overrides)
     routing = RoutingConfig(**routing_defaults)
     ab_routing = ABRoutingConfig(**(ab_routing_overrides or {}))
+    policy_learning = PolicyLearningConfig(**(policy_learning_overrides or {}))
     settings = Settings(
         server=ServerConfig(), routing=routing, cache=CacheConfig(enabled=False), benchmark=BenchmarkConfig(),
-        ab_routing=ab_routing, providers={}, raw_routing={},
+        ab_routing=ab_routing, policy_learning=policy_learning, providers={}, raw_routing={},
     )
 
-    router = AdaptiveRouter(providers, models, circuits, quota, default_policy=routing.default_policy)
-    cache = CacheManager(settings.cache, db_path)
     metrics_repo = MetricsRepository(db)
+    policy_learner = PolicyLearner(
+        ab_routing.variants, metrics_repo, enabled=policy_learning.enabled,
+        min_samples=policy_learning.min_samples, learning_rate=policy_learning.learning_rate,
+        min_margin=policy_learning.min_margin, latency_weight_per_second=policy_learning.latency_weight_per_second,
+        quality_weight=policy_learning.quality_weight,
+    )
+    router = AdaptiveRouter(
+        providers, models, circuits, quota, default_policy=routing.default_policy, policy_learner=policy_learner,
+    )
+    cache = CacheManager(settings.cache, db_path)
     ab_router = ABRouter(ab_routing.variants, metrics_repo, enabled=ab_routing.enabled)
 
     ctx = AppContext(
@@ -256,6 +272,7 @@ async def build_test_engine(
         provider_repo=ProviderRepository(db), model_repo=ModelRepository(db), request_repo=RequestRepository(db),
         metrics_repo=metrics_repo, health_monitor=None, performance=None, tools=tools,
         memory_repo=MemoryRepository(db), benchmark_scheduler=None, ab_router=ab_router,
+        policy_learner=policy_learner,
     )
     return ChatEngine(ctx)
 
