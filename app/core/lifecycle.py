@@ -14,6 +14,7 @@ from app.quota.tracker import get_quota_tracker
 from app.reliability.benchmark import BenchmarkScheduler
 from app.reliability.circuit_breaker import CircuitBreakerRegistry
 from app.reliability.health import HealthMonitor
+from app.routing.ab_router import ABRouter
 from app.routing.performance_controller import PerformanceController
 from app.routing.router import AdaptiveRouter
 from app.routing.scheduler import ConcurrencyLimiter
@@ -80,6 +81,8 @@ async def startup(settings: Settings | None = None) -> AppContext:
     if settings.benchmark.enabled:
         benchmark_scheduler.start()
 
+    ab_router = ABRouter(settings.ab_routing.variants, metrics_repo, enabled=settings.ab_routing.enabled)
+
     tools = build_tool_registry(settings)
 
     logger.info(
@@ -93,7 +96,7 @@ async def startup(settings: Settings | None = None) -> AppContext:
         router=router, limiter=limiter, cache=cache, metrics=metrics, events=events, db=db,
         provider_repo=provider_repo, model_repo=model_repo, request_repo=request_repo,
         metrics_repo=metrics_repo, health_monitor=health_monitor, performance=performance, tools=tools,
-        memory_repo=memory_repo, benchmark_scheduler=benchmark_scheduler,
+        memory_repo=memory_repo, benchmark_scheduler=benchmark_scheduler, ab_router=ab_router,
     )
 
 

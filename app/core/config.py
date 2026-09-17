@@ -125,11 +125,25 @@ class BenchmarkConfig:
 
 
 @dataclass
+class ABRoutingConfig:
+    """A/B Routing (Phase 5's second piece, section 三十六): off by default.
+    Unlike Automated Benchmark (a timer that costs real provider calls),
+    turning this on changes how *every* non-pinned request already being
+    served gets routed -- a real behavior change for live traffic, not an
+    extra background call -- so it gets the same "must not turn on
+    silently" default as everything else in this family. See
+    app/routing/ab_router.py."""
+    enabled: bool = False
+    variants: list[str] = field(default_factory=lambda: ["quality", "balanced"])
+
+
+@dataclass
 class Settings:
     server: ServerConfig
     routing: RoutingConfig
     cache: CacheConfig
     benchmark: BenchmarkConfig
+    ab_routing: ABRoutingConfig
     providers: dict[str, ProviderConfig]
     raw_routing: dict[str, Any]
     model_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -193,6 +207,12 @@ class Settings:
             max_tokens=int(benchmark_raw.get("max_tokens", 8)),
         )
 
+        ab_routing_raw = raw_config.get("ab_routing", {})
+        ab_routing = ABRoutingConfig(
+            enabled=bool(ab_routing_raw.get("enabled", False)),
+            variants=ab_routing_raw.get("variants", ABRoutingConfig().variants),
+        )
+
         providers: dict[str, ProviderConfig] = {}
         for pid, pcfg in (raw_providers.get("providers") or {}).items():
             providers[pid] = ProviderConfig(
@@ -229,8 +249,8 @@ class Settings:
             )
 
         return cls(
-            server=server, routing=routing, cache=cache, benchmark=benchmark, providers=providers,
-            raw_routing=raw_routing, model_overrides=model_overrides, tools=tools,
+            server=server, routing=routing, cache=cache, benchmark=benchmark, ab_routing=ab_routing,
+            providers=providers, raw_routing=raw_routing, model_overrides=model_overrides, tools=tools,
         )
 
 

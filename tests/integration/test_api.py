@@ -125,6 +125,29 @@ def test_admin_benchmark_and_history_are_graceful_with_no_providers_reachable(cl
     assert resp.json()["benchmarks"] == before  # no new row persisted by a no-op run
 
 
+def test_admin_ab_routing_summary_requires_auth(client):
+    resp = client.get("/admin/ab_routing/summary")
+    assert resp.status_code == 401
+
+
+def test_admin_ab_routing_summary_reports_the_real_running_config(client):
+    # ab_routing is off by default in config/config.yaml. Mirrors the lesson
+    # from the Automated Benchmark piece's own two follow-up fixes: this
+    # suite runs against the real, persistent data/xrouter.sqlite3, so
+    # ab_results may already hold rows from an earlier run (possibly with a
+    # different config) -- never assert `results` comes back empty. Instead
+    # assert the shape and that `enabled`/`variants` reflect the actual
+    # running Settings.
+    ctx = app.state.context
+    token = ctx.settings.server.admin_token
+    resp = client.get("/admin/ab_routing/summary", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["enabled"] == ctx.settings.ab_routing.enabled
+    assert body["variants"] == ctx.settings.ab_routing.variants
+    assert isinstance(body["results"], dict)
+
+
 def test_request_body_too_large_rejected(client):
     from app.core.config import get_settings
 

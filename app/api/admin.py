@@ -61,6 +61,20 @@ async def admin_benchmark_history(request: Request, limit: int = 50):
     return {"benchmarks": await ctx.metrics_repo.recent_benchmarks(limit)}
 
 
+@router.get("/ab_routing/summary", dependencies=[Depends(require_admin)])
+async def admin_ab_routing_summary(request: Request):
+    """Read-back for A/B Routing (Phase 5's second piece) -- per-variant
+    count/success_rate/avg_latency_ms/avg_quality_score, exposed
+    immediately rather than left sitting unused (the lesson from Automated
+    Benchmark's own recent_benchmarks gap)."""
+    ctx = request.app.state.context
+    return {
+        "enabled": ctx.settings.ab_routing.enabled,
+        "variants": ctx.settings.ab_routing.variants,
+        "results": await ctx.metrics_repo.ab_summary(),
+    }
+
+
 @router.post("/reload", dependencies=[Depends(require_admin)])
 async def admin_reload(request: Request):
     ctx = request.app.state.context

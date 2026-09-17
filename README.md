@@ -878,6 +878,70 @@ results back into routing scores, and takes no automatic action on what it
 finds — that's Policy Learning's and Self-healing's job, later Phase 5
 pieces that don't exist yet.
 
+### A/B Routing (Phase 5, opt-in: `ab_routing.enabled` in `config.yaml`)
+
+Phase 5's second piece (see the Automated Benchmark section above for why
+Phase 5 is being built Automated Benchmark → A/B Routing → Policy Learning
+→ Evolution Engine → Self-healing rather than the spec's literal order).
+Splits real, live traffic between two or more named routing-policy variants
+(`ab_routing.variants`, default `["quality", "balanced"]`) and records each
+request's real comparative outcome — success, latency, and quality score
+when the Quality Gate is also on — tagged by variant. This is the first
+real comparative dataset Policy Learning (the next piece) will have
+anything to learn from.
+
+Deliberately **not** the same thing as race mode (`app/execution/race.py`):
+race mode hedges the top-N candidates from a *single* policy's own ranked
+list concurrently and keeps whichever answers first — latency hedging
+within one policy. A/B Routing compares *different* policies against each
+other using real, separate traffic; it never dispatches more than one
+provider call per request.
+
+`ChatEngine._resolve_policy` is the single choke point every request's
+policy already passed through, so that's where assignment plugs in: a
+client-supplied `routing_policy` always wins and never participates (a
+self-selected policy isn't part of the controlled comparison); otherwise,
+when A/B Routing is enabled with ≥2 configured variants, `ABRouter.assign()`
+picks one — sticky per `request.user` (hashed with md5, modulo the variant
+count), or a fresh per-request UUID when the caller sends no `user` at all
+(XRouter has no session concept today, so an anonymous caller gets
+per-request rather than sticky assignment — a documented, honest
+limitation, still statistically valid in aggregate). That assignment wins
+over both the Task Classifier's suggestion and `default_policy`, since
+turning A/B Routing on is a real, documented behavior change for all
+non-pinned traffic.
+
+A successful response produced under an assignment gets
+`response.xrouter["ab_experiment"] = True` (mirroring how race mode already
+sets `response.xrouter["race"] = True` alongside the existing `policy`
+field, rather than duplicating the variant name under a second key). A
+cache hit never records an A/B outcome — a cached response reflects a
+possibly-different request/variant's prior real work, not this variant's
+work this time — though assignment itself still happens first, for
+stickiness. Outcomes are recorded at every existing telemetry point
+(mirroring, not replacing, the pre-existing `metrics.record_request(...)`
+calls): both `NoAvailableModelError` catches record a failure, and the
+non-streaming/streaming success paths record a success, with a quality
+score only when the (also opt-in) Quality Gate ran.
+
+```bash
+curl "http://localhost:20128/admin/ab_routing/summary" -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{ "enabled": true, "variants": ["quality", "balanced"],
+  "results": {
+    "quality": { "count": 12, "success_rate": 0.917, "avg_latency_ms": 812.4, "avg_quality_score": 0.78 },
+    "balanced": { "count": 9, "success_rate": 1.0, "avg_latency_ms": 340.1, "avg_quality_score": null }
+  } }
+```
+
+Off by default (`ab_routing.enabled: false`) — the same "must not turn on
+silently" reasoning already applied to `routing.race_mode_enabled`,
+`routing.quality_gate_enabled`, and `benchmark.enabled`, since this changes
+how every non-pinned request already being served gets routed, not just an
+extra background call.
+
 ## Tests
 
 ```bash
@@ -885,7 +949,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-353 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+367 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -1074,7 +1138,26 @@ idempotent, a real background cycle actually persisting a row); and,
 full-stack, `GET /admin/benchmark/history` requiring the same admin token
 as every other `/admin/*` route, plus both the manual `POST
 /admin/benchmark` trigger and its history read-back staying gracefully
-empty rather than erroring when no provider is reachable.
+empty rather than erroring when no provider is reachable. A/B Routing
+(`tests/routing/test_ab_router.py`, `tests/unit/test_engine_ab_routing.py`,
+`tests/integration/test_api.py`) — `ABRouter.assign()` in isolation:
+`None` when disabled or with fewer than 2 configured variants, sticky
+assignment for a repeated `request.user` across many calls, assignment
+actually varying across distinct users, and a roughly even split across
+many anonymous (no-`user`) requests; `record_outcome()` persisting and
+`MetricsRepository.ab_summary()` aggregating count/success_rate/
+avg_latency_ms/avg_quality_score correctly per variant, including a `NULL`
+`quality_score` on some rows never poisoning the average of the rows that
+have one; and, end-to-end through a real `ChatEngine.handle_chat()`, an
+explicit `routing_policy` bypassing A/B entirely even when it happens to
+match a configured variant name, a disabled config being a complete
+no-op, an enabled config assigning a variant/tagging
+`xrouter["ab_experiment"]`/persisting a matching outcome, a
+`NoAvailableModelError` failure still recording a failed outcome, a cache
+hit never recording a second outcome for the same sticky user, and, full
+stack, `GET /admin/ab_routing/summary` requiring the same admin token as
+every other `/admin/*` route and reporting the real running
+`enabled`/`variants` config.
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -1286,12 +1369,20 @@ background task (same hand-rolled loop shape `HealthMonitor` and
 real provider call automatically, and exposes the previously-unreachable
 `recent_benchmarks()` history over `GET /admin/benchmark/history`.
 Deliberately does not analyze trends or act on what it finds — that's
-later pieces' job.
+later pieces' job. A/B Routing (`app/routing/ab_router.py`,
+`app/core/engine.py`, `app/api/admin.py`) — the second piece. Splits real,
+live traffic between named routing-policy variants (sticky per
+`request.user`, off by default) and records each request's real
+comparative outcome tagged by variant over `GET
+/admin/ab_routing/summary`, producing the first real comparative dataset
+Policy Learning (the next piece) will have anything to learn from. See
+the A/B Routing section above for the full design, including how it
+differs from race mode and why cache hits never record an outcome.
 
 ## What's not implemented yet (by design — see Phase 5 in the spec)
 
-Four of Phase 5's five pieces remain: A/B Routing, Policy Learning,
-Evolution Engine, and Self-healing (Automated Benchmark is done, see
+Three of Phase 5's five pieces remain: Policy Learning, Evolution Engine,
+and Self-healing (Automated Benchmark and A/B Routing are done, see
 above) — being built one piece at a time, in the dependency order
 explained above, each with its own review checkpoint. Also still open:
 other tool types beyond

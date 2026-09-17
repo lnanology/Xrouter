@@ -10,7 +10,8 @@ logger = get_logger("repo.metrics")
 
 
 class MetricsRepository:
-    """Backs routing_metrics, quota_usage, benchmarks, and events tables."""
+    """Backs routing_metrics, quota_usage, benchmarks, ab_results, and events
+    tables."""
 
     def __init__(self, db: Database):
         self._db = db
@@ -63,6 +64,43 @@ class MetricsRepository:
                 await conn.commit()
         except Exception as e:
             logger.warning("record_event failed: %s", e)
+
+    async def record_ab_result(
+        self, variant: str, success: bool, latency_ms: float | None, quality_score: float | None = None,
+    ) -> None:
+        try:
+            async with self._db.connect() as conn:
+                await conn.execute(
+                    "INSERT INTO ab_results (variant, success, latency_ms, quality_score, recorded_at)"
+                    " VALUES (?,?,?,?,?)",
+                    (variant, int(success), latency_ms, quality_score, time.time()),
+                )
+                await conn.commit()
+        except Exception as e:
+            logger.warning("record_ab_result failed: %s", e)
+
+    async def ab_summary(self) -> dict[str, dict]:
+        """One row per variant: {count, success_rate, avg_latency_ms,
+        avg_quality_score}. AVG() over a nullable column (latency_ms,
+        quality_score) already skips NULLs in SQLite, so a variant with some
+        rows missing a quality score still gets a meaningful average over
+        the rows that have one, rather than the whole aggregate going NULL."""
+        try:
+            async with self._db.connect() as conn:
+                cursor = await conn.execute(
+                    "SELECT variant, COUNT(*), AVG(success), AVG(latency_ms), AVG(quality_score)"
+                    " FROM ab_results GROUP BY variant"
+                )
+                rows = await cursor.fetchall()
+                return {
+                    r[0]: {
+                        "count": r[1], "success_rate": r[2], "avg_latency_ms": r[3], "avg_quality_score": r[4],
+                    }
+                    for r in rows
+                }
+        except Exception as e:
+            logger.warning("ab_summary failed: %s", e)
+            return {}
 
     async def recent_benchmarks(self, limit: int = 50) -> list[dict]:
         try:

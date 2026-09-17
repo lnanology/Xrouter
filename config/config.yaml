@@ -33,3 +33,12 @@ benchmark:
   interval_seconds: 3600
   prompt: "Reply with the single word: OK"
   max_tokens: 8
+
+# A/B Routing (Phase 5): off by default -- enabling this changes how every
+# non-pinned request gets routed, splitting live traffic across the listed
+# policy variants (same reasoning as routing.race_mode_enabled).
+ab_routing:
+  enabled: false
+  variants:
+    - quality
+    - balanced

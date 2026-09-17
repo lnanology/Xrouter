@@ -28,15 +28,31 @@ class ChatEngine:
     def __init__(self, ctx: AppContext):
         self.ctx = ctx
 
-    def _resolve_policy(self, request: ChatCompletionRequest, classification: TaskClassification) -> str:
-        """A client-supplied routing_policy always wins. Otherwise, if the
-        Task Classifier is enabled (section 三十六 Phase 2), use its
-        suggestion; else fall back to the static Phase 1 default_policy."""
+    def _resolve_policy(
+        self, request: ChatCompletionRequest, classification: TaskClassification,
+    ) -> tuple[str, str | None]:
+        """A client-supplied routing_policy always wins, and never
+        participates in A/B Routing (section 三十六 Phase 5) — a
+        self-selected policy isn't part of the controlled comparison and
+        must not confound it. Otherwise, when A/B Routing is enabled and
+        configured with >=2 variants, its assignment wins next: turning A/B
+        Routing on is a real, documented behavior change for all non-pinned
+        traffic, the same as any other config flag that alters default
+        request handling. Otherwise, if the Task Classifier is enabled
+        (Phase 2), use its suggestion; else fall back to the static Phase 1
+        default_policy.
+
+        Returns (policy, ab_variant) — ab_variant is non-None only when
+        `policy` came from a controlled A/B assignment, so callers know
+        whether to record an A/B outcome for this request."""
         if request.routing_policy:
-            return request.routing_policy
+            return request.routing_policy, None
+        ab_variant = self.ctx.ab_router.assign(request)
+        if ab_variant is not None:
+            return ab_variant, ab_variant
         if self.ctx.settings.routing.task_aware_policy:
-            return classification.suggested_policy
-        return self.ctx.settings.routing.default_policy
+            return classification.suggested_policy, None
+        return self.ctx.settings.routing.default_policy, None
 
     def _use_race(self, request: ChatCompletionRequest) -> bool:
         """Race mode (section 三十六) needs both the server-wide switch on
@@ -86,7 +102,7 @@ class ChatEngine:
     async def handle_chat(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         request_id = new_id("req")
         classification = classify(request)
-        policy = self._resolve_policy(request, classification)
+        policy, ab_variant = self._resolve_policy(request, classification)
         record = RequestRecord(
             request_id=request_id, task_type=classification.task_type.value,
             complexity=classification.complexity, routing_policy=policy,
@@ -104,6 +120,10 @@ class ChatEngine:
                 await self.ctx.request_repo.save(record)
                 self.ctx.metrics.record_request(latency_ms=record.latency_ms, success=True, cache_hit=True)
                 self.ctx.events.emit("cache.hit", {"request_id": request_id})
+                # A cache hit reflects a possibly-different request/variant's
+                # prior execution, not this variant's real work this time —
+                # assignment already happened above for stickiness, but the
+                # A/B outcome itself is never recorded on a cache hit.
                 return ChatCompletionResponse.model_validate(cached)
             self.ctx.events.emit("cache.miss", {"request_id": request_id})
 
@@ -115,6 +135,8 @@ class ChatEngine:
             record.latency_ms = (time.time() - start) * 1000
             await self.ctx.request_repo.save(record)
             self.ctx.metrics.record_request(latency_ms=record.latency_ms, success=False)
+            if ab_variant is not None:
+                await self.ctx.ab_router.record_outcome(ab_variant, success=False, latency_ms=record.latency_ms)
             raise
 
         self.ctx.events.emit("provider.selected", {"request_id": request_id, "provider_id": decision.primary.provider_id})
@@ -151,6 +173,8 @@ class ChatEngine:
                 await self.ctx.request_repo.record_attempt(
                     request_id, i, a["provider_id"], a["model_id"], a["status"], a.get("latency_ms"), a.get("error")
                 )
+            if ab_variant is not None:
+                await self.ctx.ab_router.record_outcome(ab_variant, success=False, latency_ms=record.latency_ms)
             raise
 
         if self.ctx.settings.routing.quality_gate_enabled:
@@ -173,6 +197,16 @@ class ChatEngine:
         )
         self.ctx.events.emit("request.completed", {"request_id": request_id, "latency_ms": latency_ms})
 
+        if ab_variant is not None:
+            quality_score = None
+            if response.xrouter and "quality" in response.xrouter:
+                quality_score = response.xrouter["quality"].get("score")
+            await self.ctx.ab_router.record_outcome(
+                ab_variant, success=True, latency_ms=latency_ms, quality_score=quality_score
+            )
+            response.xrouter = response.xrouter or {}
+            response.xrouter["ab_experiment"] = True
+
         if response.xrouter:
             response.xrouter["request_id"] = request_id
 
@@ -184,7 +218,7 @@ class ChatEngine:
     async def handle_stream_chat(self, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
         request_id = new_id("req")
         classification = classify(request)
-        policy = self._resolve_policy(request, classification)
+        policy, ab_variant = self._resolve_policy(request, classification)
         record = RequestRecord(
             request_id=request_id, task_type=classification.task_type.value,
             complexity=classification.complexity, routing_policy=policy,
@@ -201,6 +235,8 @@ class ChatEngine:
             record.latency_ms = (time.time() - start) * 1000
             await self.ctx.request_repo.save(record)
             self.ctx.metrics.record_request(latency_ms=record.latency_ms, success=False)
+            if ab_variant is not None:
+                await self.ctx.ab_router.record_outcome(ab_variant, success=False, latency_ms=record.latency_ms)
             raise
 
         self.ctx.events.emit("provider.selected", {"request_id": request_id, "provider_id": decision.primary.provider_id})
@@ -226,6 +262,8 @@ class ChatEngine:
             record.latency_ms = (time.time() - start) * 1000
             await self.ctx.request_repo.save(record)
             self.ctx.metrics.record_request(latency_ms=record.latency_ms, success=False, timeout="timed out" in str(e).lower())
+            if ab_variant is not None:
+                await self.ctx.ab_router.record_outcome(ab_variant, success=False, latency_ms=record.latency_ms)
             raise
         finally:
             latency_ms = (time.time() - start) * 1000
@@ -243,3 +281,9 @@ class ChatEngine:
                 tps = (total_chunks / (latency_ms / 1000)) if latency_ms > 0 else None
                 self.ctx.metrics.record_request(latency_ms=latency_ms, ttft_ms=ttft_ms, tokens_per_sec=tps, success=True)
                 self.ctx.events.emit("request.completed", {"request_id": request_id, "latency_ms": latency_ms})
+                # Streaming yields chunks, not a final response object to tag
+                # xrouter.ab_experiment on -- and the quality gate is
+                # non-streaming only (an existing limitation, not a new
+                # one), so no quality_score is available here.
+                if ab_variant is not None:
+                    await self.ctx.ab_router.record_outcome(ab_variant, success=True, latency_ms=latency_ms)

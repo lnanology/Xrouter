@@ -103,6 +103,15 @@ CREATE TABLE IF NOT EXISTS benchmarks (
     recorded_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS ab_results (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    variant TEXT NOT NULL,
+    success INTEGER NOT NULL,
+    latency_ms REAL,
+    quality_score REAL,
+    recorded_at REAL NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS cache_entries (
     key TEXT PRIMARY KEY,
     value TEXT NOT NULL,

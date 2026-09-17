@@ -169,7 +169,10 @@ class FakeTool:
         self.closed = True
 
 
-async def build_test_engine(tmp_path, provider_specs: dict[str, dict], tool_specs: dict[str, dict] | None = None, **routing_overrides):
+async def build_test_engine(
+    tmp_path, provider_specs: dict[str, dict], tool_specs: dict[str, dict] | None = None,
+    ab_routing_overrides: dict | None = None, **routing_overrides,
+):
     """Assembles a real ChatEngine wired to FakeProviders instead of real
     adapters — the same pieces app.core.lifecycle.startup() assembles into
     an AppContext, minus config-driven provider construction. Lets tests
@@ -185,9 +188,12 @@ async def build_test_engine(tmp_path, provider_specs: dict[str, dict], tool_spec
     graceful "not configured" path a real unconfigured tool takes).
     routing_overrides: passed straight through to RoutingConfig; defaults
     task_aware_policy to False so tests get a predictable routing policy
-    unless they override it."""
+    unless they override it.
+    ab_routing_overrides: passed straight through to ABRoutingConfig;
+    defaults to a disabled ABRouter (matching production's own default)
+    unless a test opts in with e.g. {"enabled": True, "variants": [...]}."""
     from app.cache.manager import CacheManager
-    from app.core.config import BenchmarkConfig, CacheConfig, RoutingConfig, ServerConfig, Settings
+    from app.core.config import ABRoutingConfig, BenchmarkConfig, CacheConfig, RoutingConfig, ServerConfig, Settings
     from app.core.context import AppContext
     from app.core.engine import ChatEngine
     from app.core.registry import ModelRegistry, ProviderRegistry
@@ -195,6 +201,7 @@ async def build_test_engine(tmp_path, provider_specs: dict[str, dict], tool_spec
     from app.observability.metrics import MetricsCollector
     from app.quota.tracker import QuotaTracker
     from app.reliability.circuit_breaker import CircuitBreakerRegistry
+    from app.routing.ab_router import ABRouter
     from app.routing.router import AdaptiveRouter
     from app.routing.scheduler import ConcurrencyLimiter
     from app.storage.database import Database
@@ -232,20 +239,23 @@ async def build_test_engine(tmp_path, provider_specs: dict[str, dict], tool_spec
     routing_defaults = {"task_aware_policy": False}
     routing_defaults.update(routing_overrides)
     routing = RoutingConfig(**routing_defaults)
+    ab_routing = ABRoutingConfig(**(ab_routing_overrides or {}))
     settings = Settings(
         server=ServerConfig(), routing=routing, cache=CacheConfig(enabled=False), benchmark=BenchmarkConfig(),
-        providers={}, raw_routing={},
+        ab_routing=ab_routing, providers={}, raw_routing={},
     )
 
     router = AdaptiveRouter(providers, models, circuits, quota, default_policy=routing.default_policy)
     cache = CacheManager(settings.cache, db_path)
+    metrics_repo = MetricsRepository(db)
+    ab_router = ABRouter(ab_routing.variants, metrics_repo, enabled=ab_routing.enabled)
 
     ctx = AppContext(
         settings=settings, providers=providers, models=models, circuits=circuits, quota=quota,
         router=router, limiter=limiter, cache=cache, metrics=metrics, events=events, db=db,
         provider_repo=ProviderRepository(db), model_repo=ModelRepository(db), request_repo=RequestRepository(db),
-        metrics_repo=MetricsRepository(db), health_monitor=None, performance=None, tools=tools,
-        memory_repo=MemoryRepository(db), benchmark_scheduler=None,
+        metrics_repo=metrics_repo, health_monitor=None, performance=None, tools=tools,
+        memory_repo=MemoryRepository(db), benchmark_scheduler=None, ab_router=ab_router,
     )
     return ChatEngine(ctx)
 
