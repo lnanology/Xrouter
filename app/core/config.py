@@ -110,10 +110,26 @@ class CacheConfig:
 
 
 @dataclass
+class BenchmarkConfig:
+    """Automated Benchmark (Phase 5's first piece, section 三十六): off by
+    default. Unlike the always-on HealthMonitor (its health() polling is
+    assumed cheap and provider-defined), this fires a real chat completion
+    against every enabled provider on a timer with no per-request trigger --
+    same "costs real money, must not turn on silently" reasoning already
+    established for race_mode_enabled / quality_gate_enabled /
+    trace_evidence / trace_counterfactual. See app/reliability/benchmark.py."""
+    enabled: bool = False
+    interval_seconds: float = 3600.0
+    prompt: str = "Reply with the single word: OK"
+    max_tokens: int = 8
+
+
+@dataclass
 class Settings:
     server: ServerConfig
     routing: RoutingConfig
     cache: CacheConfig
+    benchmark: BenchmarkConfig
     providers: dict[str, ProviderConfig]
     raw_routing: dict[str, Any]
     model_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -169,6 +185,14 @@ class Settings:
             volatile_keywords=cache_raw.get("volatile_keywords", CacheConfig().volatile_keywords),
         )
 
+        benchmark_raw = raw_config.get("benchmark", {})
+        benchmark = BenchmarkConfig(
+            enabled=bool(benchmark_raw.get("enabled", False)),
+            interval_seconds=float(benchmark_raw.get("interval_seconds", 3600.0)),
+            prompt=benchmark_raw.get("prompt", BenchmarkConfig.prompt),
+            max_tokens=int(benchmark_raw.get("max_tokens", 8)),
+        )
+
         providers: dict[str, ProviderConfig] = {}
         for pid, pcfg in (raw_providers.get("providers") or {}).items():
             providers[pid] = ProviderConfig(
@@ -205,7 +229,7 @@ class Settings:
             )
 
         return cls(
-            server=server, routing=routing, cache=cache, providers=providers,
+            server=server, routing=routing, cache=cache, benchmark=benchmark, providers=providers,
             raw_routing=raw_routing, model_overrides=model_overrides, tools=tools,
         )
 

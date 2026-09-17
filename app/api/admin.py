@@ -45,32 +45,20 @@ async def admin_metrics(request: Request):
 @router.post("/benchmark", dependencies=[Depends(require_admin)])
 async def admin_benchmark(request: Request):
     """Sends one small prompt to each healthy, enabled provider's first
-    available model and records TTFT/latency/success (section 三十五)."""
+    available model and records TTFT/latency/success (section 三十五).
+    The probe itself now lives in app/reliability/benchmark.py's
+    BenchmarkScheduler (Phase 5's Automated Benchmark) so the same logic
+    also runs on a schedule, not just from this manual trigger."""
     ctx = request.app.state.context
-    from app.contracts.request import ChatCompletionRequest, ChatMessage
+    return {"results": await ctx.benchmark_scheduler.run_once()}
 
-    results = []
-    test_request = ChatCompletionRequest(
-        model="auto", messages=[ChatMessage(role="user", content="Reply with the single word: OK")], stream=False, max_tokens=8
-    )
-    for pid, provider in ctx.providers.all().items():
-        if not ctx.providers.is_enabled(pid):
-            continue
-        models = ctx.models.for_provider(pid)
-        if not models:
-            continue
-        model = models[0]
-        start = time.time()
-        success = False
-        try:
-            await provider.chat(model.name, test_request)
-            success = True
-        except Exception as e:
-            logger.info("benchmark call failed for %s/%s: %s", pid, model.name, e)
-        latency_ms = (time.time() - start) * 1000
-        await ctx.metrics_repo.record_benchmark(pid, model.name, None, latency_ms, None, success)
-        results.append({"provider": pid, "model": model.name, "latency_ms": round(latency_ms, 1), "success": success})
-    return {"results": results}
+
+@router.get("/benchmark/history", dependencies=[Depends(require_admin)])
+async def admin_benchmark_history(request: Request, limit: int = 50):
+    """Read-back for the benchmarks table -- MetricsRepository.
+    recent_benchmarks() already existed but was never exposed anywhere."""
+    ctx = request.app.state.context
+    return {"benchmarks": await ctx.metrics_repo.recent_benchmarks(limit)}
 
 
 @router.post("/reload", dependencies=[Depends(require_admin)])

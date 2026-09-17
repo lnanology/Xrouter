@@ -146,6 +146,7 @@ curl http://localhost:20128/health/providers
 curl http://localhost:20128/admin/providers   -H "Authorization: Bearer $TOKEN"
 curl http://localhost:20128/admin/metrics     -H "Authorization: Bearer $TOKEN"
 curl -X POST http://localhost:20128/admin/benchmark -H "Authorization: Bearer $TOKEN"
+curl "http://localhost:20128/admin/benchmark/history?limit=50" -H "Authorization: Bearer $TOKEN"
 curl -X POST http://localhost:20128/admin/reload    -H "Authorization: Bearer $TOKEN"
 curl -X POST http://localhost:20128/admin/providers/groq/enable   -H "Authorization: Bearer $TOKEN"
 curl -X POST http://localhost:20128/admin/providers/groq/disable  -H "Authorization: Bearer $TOKEN"
@@ -820,6 +821,63 @@ Gate (`app/intelligence/quality_gate.py`, Phase 2) already uses for its
 own, differently-scoped, single-response structural check — see that
 module's own docstring for the full division between the two.
 
+### Automated Benchmark (Phase 5, opt-in: `benchmark.enabled` in `config.yaml`)
+
+Phase 5's first piece. The spec lists Phase 5 as Evolution Engine, A/B
+Routing, Policy Learning, Self-healing, Automated Benchmark — but that
+literal order doesn't survive contact with what those names actually
+imply: Evolution Engine is, by construction, a loop that repeatedly runs
+A/B Routing to compare policy variants and feeds the result into Policy
+Learning to update policy weights. Built first, with neither of those two
+existing yet, it would have nothing real to evolve and could only ever be
+a stub — exactly the "fake placeholder functionality" this project's own
+rules forbid. Phase 5 is therefore being built in dependency order
+instead: **Automated Benchmark → A/B Routing → Policy Learning → Evolution
+Engine → Self-healing**. Self-healing doesn't depend on the other four, so
+it's simply placed last rather than forced earlier.
+
+Two benchmark code paths already existed before this piece:
+`scripts/benchmark.py` (a richer manual CLI tool — multiple runs,
+p50/p95/p99 — that only ever prints, never persists) and `POST
+/admin/benchmark` (a single-prompt probe that does persist to the
+`benchmarks` table, but only when someone calls it — nothing scheduled it,
+and `MetricsRepository.recent_benchmarks()` already existed to read that
+table back but was never exposed anywhere). This piece doesn't add a third
+path: it moves `/admin/benchmark`'s own probe logic, verbatim, into
+`app/reliability/benchmark.py`'s `BenchmarkScheduler`, so the exact same
+behavior now also runs on a timer, and exposes the read-back that already
+existed as `GET /admin/benchmark/history`:
+
+```bash
+curl -X POST http://localhost:20128/admin/benchmark -H "Authorization: Bearer $TOKEN"
+curl "http://localhost:20128/admin/benchmark/history?limit=20" -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{ "benchmarks": [
+  { "provider_id": "groq", "model_id": "llama-3.1-8b-instant", "ttft_ms": null,
+    "total_latency_ms": 214.3, "tokens_per_sec": null, "success": true, "recorded_at": 1234567890.1 }
+] }
+```
+
+`BenchmarkScheduler` reuses the exact same hand-rolled background-loop
+shape `HealthMonitor` and `PerformanceController` already use
+(`start()`/`_loop()`/`stop()`, an `asyncio.Event` stop signal, one unit of
+work per interval) — no new generic scheduler abstraction, since two
+existing instances of that shape is this codebase's own established
+convention for a periodic task, not a gap needing to be filled. Off by
+default (`benchmark.enabled: false`), the same "shouldn't turn on
+silently" reasoning already applied to `routing.race_mode_enabled` and
+`routing.quality_gate_enabled` — this fires a real chat completion against
+every enabled provider on a timer with no per-request trigger, so it must
+be opted into explicitly rather than starting automatically like the
+always-on, assumed-cheap `HealthMonitor` polling does.
+
+Deliberately narrow: this piece does not analyze trends, does not feed
+results back into routing scores, and takes no automatic action on what it
+finds — that's Policy Learning's and Self-healing's job, later Phase 5
+pieces that don't exist yet.
+
 ## Tests
 
 ```bash
@@ -827,7 +885,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-343 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+353 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -1004,6 +1062,20 @@ scoring `1.0`, and reusing the tier-4 debate-fails-open scenario to
 confirm `confidence.reasons` actually includes `"debate_failed_open"`
 there.
 
+Phase 5 coverage: Automated Benchmark
+(`tests/reliability/test_benchmark.py`, `tests/integration/test_api.py`)
+— `run_once()` against `FakeProvider`s: one persisted result per enabled
+provider, a failing provider recorded as `success: False` without
+aborting the rest of the batch, disabled providers and providers with no
+models both skipped, an empty provider set returning `[]` rather than
+raising; `start()`/`stop()` lifecycle mirroring `HealthMonitor`'s own
+tested shape (`stop()` before `start()` a safe no-op, `start()` itself
+idempotent, a real background cycle actually persisting a row); and,
+full-stack, `GET /admin/benchmark/history` requiring the same admin token
+as every other `/admin/*` route, plus both the manual `POST
+/admin/benchmark` trigger and its history read-back staying gracefully
+empty rather than erroring when no provider is reachable.
+
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
 real macOS + Python 3.14 run of the full suite (the "no providers
@@ -1011,7 +1083,7 @@ reachable" tests now explicitly disable every provider rather than relying
 on the host having none installed, and the cache fixture uses
 `asyncio.run()` instead of the now-removed implicit-event-loop fallback).
 
-## What's implemented (Phase 1 + Phase 2 + Phase 3 + Phase 4)
+## What's implemented (Phase 1 + Phase 2 + Phase 3 + Phase 4 + partial Phase 5)
 
 **Phase 1:** FastAPI gateway · OpenAI-compatible `/v1/models` +
 `/v1/chat/completions` (incl. `stream=true`) · Provider adapter interface +
@@ -1201,14 +1273,28 @@ response's own text for structural defects and can trigger a retry — see
 the Confidence Engine section above and that module's own docstring for
 the full division.
 
+**Phase 5 (so far):** Automated Benchmark (`app/reliability/benchmark.py`,
+`app/api/admin.py`) — the first piece, built out of the spec's own listed
+order (see the Automated Benchmark section above for why: Evolution
+Engine, listed first, needs A/B Routing and Policy Learning to already
+exist before it can genuinely evolve anything, so Phase 5 is being built
+in dependency order instead — Automated Benchmark, A/B Routing, Policy
+Learning, Evolution Engine, Self-healing). `BenchmarkScheduler` turns
+`POST /admin/benchmark`'s own manual probe logic into a scheduled
+background task (same hand-rolled loop shape `HealthMonitor` and
+`PerformanceController` already use), off by default since it spends a
+real provider call automatically, and exposes the previously-unreachable
+`recent_benchmarks()` history over `GET /admin/benchmark/history`.
+Deliberately does not analyze trends or act on what it finds — that's
+later pieces' job.
+
 ## What's not implemented yet (by design — see Phase 5 in the spec)
 
-Phase 4 is fully done (Evidence Graph, Debate, Counterfactual, Simulation,
-Confidence Engine — see above). Phase 5 (Evolution Engine, A/B Routing,
-Policy Learning, Self-healing, Automated Benchmark) hasn't started; being
-built one piece at a time, in that
-order, each with its own review checkpoint. Also still open: other tool
-types beyond
+Four of Phase 5's five pieces remain: A/B Routing, Policy Learning,
+Evolution Engine, and Self-healing (Automated Benchmark is done, see
+above) — being built one piece at a time, in the dependency order
+explained above, each with its own review checkpoint. Also still open:
+other tool types beyond
 `web_search`, multi-turn agent loops,
 tool-using agents that act on a plan's own intermediate results mid-run
 rather than a single forced-JSON planning call up front, a real

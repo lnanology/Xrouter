@@ -11,6 +11,7 @@ from app.observability.events import get_event_bus
 from app.observability.logging import get_logger
 from app.observability.metrics import get_metrics
 from app.quota.tracker import get_quota_tracker
+from app.reliability.benchmark import BenchmarkScheduler
 from app.reliability.circuit_breaker import CircuitBreakerRegistry
 from app.reliability.health import HealthMonitor
 from app.routing.performance_controller import PerformanceController
@@ -71,6 +72,14 @@ async def startup(settings: Settings | None = None) -> AppContext:
     health_monitor = HealthMonitor(providers, circuits, provider_repo, interval_seconds=20.0)
     health_monitor.start()
 
+    benchmark_scheduler = BenchmarkScheduler(
+        providers, models, metrics_repo,
+        prompt=settings.benchmark.prompt, max_tokens=settings.benchmark.max_tokens,
+        interval_seconds=settings.benchmark.interval_seconds,
+    )
+    if settings.benchmark.enabled:
+        benchmark_scheduler.start()
+
     tools = build_tool_registry(settings)
 
     logger.info(
@@ -84,7 +93,7 @@ async def startup(settings: Settings | None = None) -> AppContext:
         router=router, limiter=limiter, cache=cache, metrics=metrics, events=events, db=db,
         provider_repo=provider_repo, model_repo=model_repo, request_repo=request_repo,
         metrics_repo=metrics_repo, health_monitor=health_monitor, performance=performance, tools=tools,
-        memory_repo=memory_repo,
+        memory_repo=memory_repo, benchmark_scheduler=benchmark_scheduler,
     )
 
 
@@ -92,6 +101,7 @@ async def shutdown(ctx: AppContext) -> None:
     logger.info("shutdown starting")
     await ctx.health_monitor.stop()
     await ctx.performance.stop()
+    await ctx.benchmark_scheduler.stop()
     await ctx.providers.close_all()
     await ctx.tools.close_all()
     logger.info("shutdown complete")

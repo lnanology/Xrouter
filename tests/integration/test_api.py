@@ -98,6 +98,23 @@ def test_admin_metrics_reflects_recorded_requests(client):
     assert resp.json()["metrics"]["counters"]["requests_total"] >= 1
 
 
+def test_admin_benchmark_history_requires_auth(client):
+    resp = client.get("/admin/benchmark/history")
+    assert resp.status_code == 401
+
+
+def test_admin_benchmark_and_history_are_graceful_with_no_providers_reachable(client):
+    ctx = app.state.context
+    token = ctx.settings.server.admin_token
+    resp = client.post("/admin/benchmark", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json()["results"] == []  # no enabled/reachable provider in this environment
+
+    resp = client.get("/admin/benchmark/history", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json()["benchmarks"] == []
+
+
 def test_request_body_too_large_rejected(client):
     from app.core.config import get_settings
 

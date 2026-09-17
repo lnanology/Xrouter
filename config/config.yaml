@@ -24,3 +24,12 @@ cache:
     - price
     - stock
     - weather
+
+# Automated Benchmark (Phase 5): off by default -- enabling this fires a
+# real chat completion against every enabled provider on a timer, so it
+# shouldn't turn on silently (same reasoning as routing.race_mode_enabled).
+benchmark:
+  enabled: false
+  interval_seconds: 3600
+  prompt: "Reply with the single word: OK"
+  max_tokens: 8

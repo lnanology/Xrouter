@@ -12,6 +12,7 @@ from app.core.registry import ModelRegistry, ProviderRegistry
 from app.observability.events import EventBus
 from app.observability.metrics import MetricsCollector
 from app.quota.tracker import QuotaTracker
+from app.reliability.benchmark import BenchmarkScheduler
 from app.reliability.circuit_breaker import CircuitBreakerRegistry
 from app.reliability.health import HealthMonitor
 from app.routing.performance_controller import PerformanceController
@@ -47,3 +48,4 @@ class AppContext:
     performance: PerformanceController
     tools: ToolRegistry
     memory_repo: MemoryRepository
+    benchmark_scheduler: BenchmarkScheduler

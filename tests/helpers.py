@@ -187,7 +187,7 @@ async def build_test_engine(tmp_path, provider_specs: dict[str, dict], tool_spec
     task_aware_policy to False so tests get a predictable routing policy
     unless they override it."""
     from app.cache.manager import CacheManager
-    from app.core.config import CacheConfig, RoutingConfig, ServerConfig, Settings
+    from app.core.config import BenchmarkConfig, CacheConfig, RoutingConfig, ServerConfig, Settings
     from app.core.context import AppContext
     from app.core.engine import ChatEngine
     from app.core.registry import ModelRegistry, ProviderRegistry
@@ -232,7 +232,10 @@ async def build_test_engine(tmp_path, provider_specs: dict[str, dict], tool_spec
     routing_defaults = {"task_aware_policy": False}
     routing_defaults.update(routing_overrides)
     routing = RoutingConfig(**routing_defaults)
-    settings = Settings(server=ServerConfig(), routing=routing, cache=CacheConfig(enabled=False), providers={}, raw_routing={})
+    settings = Settings(
+        server=ServerConfig(), routing=routing, cache=CacheConfig(enabled=False), benchmark=BenchmarkConfig(),
+        providers={}, raw_routing={},
+    )
 
     router = AdaptiveRouter(providers, models, circuits, quota, default_policy=routing.default_policy)
     cache = CacheManager(settings.cache, db_path)
@@ -242,7 +245,7 @@ async def build_test_engine(tmp_path, provider_specs: dict[str, dict], tool_spec
         router=router, limiter=limiter, cache=cache, metrics=metrics, events=events, db=db,
         provider_repo=ProviderRepository(db), model_repo=ModelRepository(db), request_repo=RequestRepository(db),
         metrics_repo=MetricsRepository(db), health_monitor=None, performance=None, tools=tools,
-        memory_repo=MemoryRepository(db),
+        memory_repo=MemoryRepository(db), benchmark_scheduler=None,
     )
     return ChatEngine(ctx)
 
