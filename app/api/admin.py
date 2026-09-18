@@ -110,6 +110,23 @@ async def admin_evolution_run_once(request: Request):
     return await ctx.evolution_engine.run_once()
 
 
+@router.get("/self_healing/status", dependencies=[Depends(require_admin)])
+async def admin_self_healing_status(request: Request):
+    """Current streak/disabled state -- see SelfHealer.snapshot()."""
+    ctx = request.app.state.context
+    return ctx.self_healer.snapshot()
+
+
+@router.post("/self_healing/run_once", dependencies=[Depends(require_admin)])
+async def admin_self_healing_run_once(request: Request):
+    """Manually triggers one full SelfHealer cycle, regardless of whether
+    self_healing.enabled gates the background schedule -- same "manual
+    trigger works independent of the schedule switch" precedent as every
+    other Phase 5 piece's manual route."""
+    ctx = request.app.state.context
+    return await ctx.self_healer.run_once()
+
+
 @router.post("/reload", dependencies=[Depends(require_admin)])
 async def admin_reload(request: Request):
     ctx = request.app.state.context
@@ -124,6 +141,9 @@ async def admin_reload(request: Request):
 async def enable_provider(provider_id: str, request: Request):
     ctx = request.app.state.context
     ctx.providers.set_enabled(provider_id, True)
+    # An explicit admin action always hands control back to the operator
+    # -- see SelfHealer.forget()'s docstring for why this must run here.
+    ctx.self_healer.forget(provider_id)
     return {"provider_id": provider_id, "enabled": True}
 
 
@@ -131,6 +151,7 @@ async def enable_provider(provider_id: str, request: Request):
 async def disable_provider(provider_id: str, request: Request):
     ctx = request.app.state.context
     ctx.providers.set_enabled(provider_id, False)
+    ctx.self_healer.forget(provider_id)
     return {"provider_id": provider_id, "enabled": False}
 
 
@@ -143,4 +164,5 @@ async def cooldown_provider(provider_id: str, request: Request, seconds: float =
     from app.contracts.provider import ProviderHealth
 
     ctx.providers.set_health(provider_id, ProviderHealth(status=ProviderStatus.COOLDOWN, last_checked=time.time()))
+    ctx.self_healer.forget(provider_id)
     return {"provider_id": provider_id, "circuit_state": breaker.state.value, "cooldown_seconds": seconds}

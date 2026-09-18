@@ -14,6 +14,7 @@ from app.quota.tracker import get_quota_tracker
 from app.reliability.benchmark import BenchmarkScheduler
 from app.reliability.circuit_breaker import CircuitBreakerRegistry
 from app.reliability.health import HealthMonitor
+from app.reliability.self_healer import SelfHealer
 from app.routing.ab_router import ABRouter
 from app.routing.evolution_engine import EvolutionEngine
 from app.routing.performance_controller import PerformanceController
@@ -84,6 +85,13 @@ async def startup(settings: Settings | None = None) -> AppContext:
     health_monitor = HealthMonitor(providers, circuits, provider_repo, interval_seconds=20.0)
     health_monitor.start()
 
+    self_healer = SelfHealer(
+        providers, circuits, events, enabled=settings.self_healing.enabled,
+        interval_seconds=settings.self_healing.interval_seconds, confirm_cycles=settings.self_healing.confirm_cycles,
+    )
+    if settings.self_healing.enabled:
+        self_healer.start()
+
     benchmark_scheduler = BenchmarkScheduler(
         providers, models, metrics_repo,
         prompt=settings.benchmark.prompt, max_tokens=settings.benchmark.max_tokens,
@@ -117,7 +125,7 @@ async def startup(settings: Settings | None = None) -> AppContext:
         provider_repo=provider_repo, model_repo=model_repo, request_repo=request_repo,
         metrics_repo=metrics_repo, health_monitor=health_monitor, performance=performance, tools=tools,
         memory_repo=memory_repo, benchmark_scheduler=benchmark_scheduler, ab_router=ab_router,
-        policy_learner=policy_learner, evolution_engine=evolution_engine,
+        policy_learner=policy_learner, evolution_engine=evolution_engine, self_healer=self_healer,
     )
 
 
@@ -127,6 +135,7 @@ async def shutdown(ctx: AppContext) -> None:
     await ctx.performance.stop()
     await ctx.benchmark_scheduler.stop()
     await ctx.evolution_engine.stop()
+    await ctx.self_healer.stop()
     await ctx.providers.close_all()
     await ctx.tools.close_all()
     logger.info("shutdown complete")

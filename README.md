@@ -875,8 +875,12 @@ always-on, assumed-cheap `HealthMonitor` polling does.
 
 Deliberately narrow: this piece does not analyze trends, does not feed
 results back into routing scores, and takes no automatic action on what it
-finds — that's Policy Learning's and Self-healing's job, later Phase 5
-pieces that don't exist yet.
+finds. Policy Learning (below) ended up being the piece that acts on data
+this codebase collects — though on A/B Routing's outcomes, not this
+piece's benchmark history; Self-healing (also below) acts on provider
+health/circuit-breaker state instead. This piece's own history stays a
+read-only, human-consulted signal for now — a future extension point, not
+built ahead of need.
 
 ### A/B Routing (Phase 5, opt-in: `ab_routing.enabled` in `config.yaml`)
 
@@ -1074,6 +1078,75 @@ isn't actually using the result — an expected consequence of the
 dependency chain, not a bug in this piece. Pending state lives in memory
 only, scoped to one process, same as Policy Learning's learned overrides.
 
+### Self-healing (Phase 5, last piece, opt-in: `self_healing.enabled` in `config.yaml`)
+
+Phase 5's fifth and final piece. The rest of the reliability stack
+already self-heals in its own scope — the circuit breaker auto-recovers
+per provider (time+probe based, no admin involved), the router filters
+out circuit-open/quota-critical candidates per request — but
+`ProviderRegistry.set_enabled()`, the one lever that takes a provider out
+of the routing pool entirely, had exactly 3 callers in the whole codebase
+before this piece: its own definition, and the two admin routes. A
+provider that's circuit-flapping or persistently unhealthy stayed in the
+pool forever unless a person noticed and disabled it by hand.
+
+This piece closes that gap by correlating two signals that already exist
+for free — `ProviderRegistry.health_of()` (updated by `HealthMonitor`'s
+own polling) and `CircuitBreakerRegistry`'s per-provider state (updated
+by real request traffic) — rather than re-probing anything itself.
+`SelfHealer` never calls `provider.health()`; it only reads state two
+other pieces already computed:
+
+```
+unhealthy = health.status in (OFFLINE, DEGRADED) or breaker.state == OPEN
+```
+
+A provider that's unhealthy by this check for `self_healing.
+confirm_cycles` consecutive background ticks (default 3, ~90s at the
+default 30s interval) gets auto-disabled (`set_enabled(False)`,
+`self_healing.disabled` event emitted); a single healthy tick resets an
+in-progress bad streak — no leaky partial credit. A provider *this piece
+itself* disabled gets auto re-enabled once it's looked healthy for
+`confirm_cycles` consecutive ticks the same way. Deliberately one
+threshold, not two independent disable/recover knobs — there's no
+evidence-backed reason for them to differ, and an extra config field is
+exactly the kind of unneeded surface area this project's rules warn
+against.
+
+The one thing this design had to get right: never fight an admin.
+Recovery candidates are drawn *only* from providers `SelfHealer` itself
+disabled — a provider an admin disables directly is never a candidate to
+auto re-enable, full stop. And every provider-mutating admin route
+(`enable`, `disable`, `cooldown`) now calls a new `SelfHealer.forget()`
+right after it acts, clearing that provider's streaks and disabled-by-
+self bookkeeping — so an admin disabling a self-disabled provider (to
+keep it off deliberately) sticks, and an admin re-enabling a still-
+unhealthy provider gets a full fresh `confirm_cycles` streak rather than
+an instant re-disable from leftover history.
+
+```bash
+curl "http://localhost:20128/admin/self_healing/status" -H "Authorization: Bearer $TOKEN"
+curl -X POST http://localhost:20128/admin/self_healing/run_once -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{ "enabled": true, "interval_seconds": 30, "confirm_cycles": 3,
+  "disabled_by_self_healing": { "groq": 1234567890.1 } }
+```
+
+Off by default (`self_healing.enabled: false`) — the same "must not turn
+on silently" reasoning as every other opt-in Phase 5 piece, since this is
+the one piece that actually takes provider enablement out of human hands
+automatically. Deliberately excludes two other signals: `QuotaTracker.
+is_paused()` is already consulted by the router's own request-time
+scoring, a different (temporary, volume-driven) kind of risk than
+sustained unavailability, and folding it in here would blur two pieces'
+responsibilities; `BenchmarkScheduler`'s history is a third passive probe
+covering the same ground `HealthMonitor.health()` already covers —
+a future extension point, not built ahead of need. All state (streaks,
+disabled-by-self bookkeeping) lives in memory only, scoped to one
+process — nothing here touches the database.
+
 ## Tests
 
 ```bash
@@ -1081,7 +1154,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-404 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+421 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -1335,7 +1408,30 @@ shape; `snapshot()`'s shape; and, full stack, both new
 built engine (safe here since pending is pure in-process state, unlike
 the persisted-DB reads above), and `POST .../run_once` always returning
 200 with the `evaluated`/`learn`/`pending` keys present regardless of how
-much real data exists to act on.
+much real data exists to act on. Self-healing
+(`tests/reliability/test_self_healer.py`, `tests/integration/test_api.py`)
+— a healthy provider (default status, closed circuit) left untouched
+across repeated `run_once()` calls; staying unhealthy for fewer than
+`confirm_cycles` cycles leaving it enabled; reaching `confirm_cycles`
+consecutive unhealthy cycles disabling it, emitting `self_healing.
+disabled`, and appearing in `snapshot()`; a single healthy tick resetting
+an in-progress bad streak rather than leaking partial credit; an
+open circuit breaker *alone* (health left healthy) also triggering a
+disable, proven via `force_open()` without touching `set_health` at all;
+a self-disabled provider recovering after `confirm_cycles` consecutive
+healthy+closed-circuit cycles and emitting `self_healing.recovered`; a
+provider disabled by anything other than `SelfHealer` itself never
+becoming a recovery candidate no matter how many healthy cycles pass;
+`forget()` making a self-disabled provider stick disabled forever after
+(the "admin wants it to stay off" case), and `forget()` after a manual
+re-enable requiring a full fresh `confirm_cycles` streak rather than an
+instant re-disable from leftover history; `snapshot()`'s shape; `start()`/
+`stop()` lifecycle mirroring `BenchmarkScheduler`'s own tested shape; and,
+full stack, both new `/admin/self_healing/*` routes requiring the same
+admin token as every other `/admin/*` route, `GET .../status` reporting
+`disabled_by_self_healing == {}` on a freshly built engine, and `POST
+.../run_once` returning the exact no-op shape on a fresh app whose real
+providers start healthy with a closed circuit.
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -1534,7 +1630,7 @@ response's own text for structural defects and can trigger a retry — see
 the Confidence Engine section above and that module's own docstring for
 the full division.
 
-**Phase 5 (so far):** Automated Benchmark (`app/reliability/benchmark.py`,
+**Phase 5 (complete):** Automated Benchmark (`app/reliability/benchmark.py`,
 `app/api/admin.py`) — the first piece, built out of the spec's own listed
 order (see the Automated Benchmark section above for why: Evolution
 Engine, listed first, needs A/B Routing and Policy Learning to already
@@ -1578,14 +1674,31 @@ fresh one, excluding any policy still awaiting evaluation. Genuine
 section above for the full design, its honest dependency on Policy
 Learning already being enabled, and why it's a real (if imperfect)
 evaluation rather than a fake scheduled wrapper.
+Self-healing (`app/reliability/self_healer.py`, `app/api/admin.py`) — the
+fifth and last piece. Correlates two signals that already existed for
+free — `ProviderRegistry.health_of()` (from `HealthMonitor`'s own
+polling) and `CircuitBreakerRegistry`'s per-provider state (from real
+request traffic) — and closes the one real automation gap left in the
+reliability stack: `set_enabled()` had exactly 3 callers in the whole
+codebase (its own definition plus the two admin routes) before this
+piece, meaning a persistently unhealthy or circuit-flapping provider
+stayed in the routing pool forever unless a person disabled it by hand.
+Auto-disables after `confirm_cycles` consecutive bad checks, auto
+re-enables a self-disabled provider after `confirm_cycles` consecutive
+good checks, off by default, over `GET/POST /admin/self_healing/
+{status,run_once}` — and never fights an admin: every provider-mutating
+admin route now calls a new `SelfHealer.forget()` so an explicit admin
+decision always wins. See the Self-healing section above for the full
+design and what it deliberately doesn't consider (quota risk, benchmark
+history) and why.
 
-## What's not implemented yet (by design — see Phase 5 in the spec)
+Phase 5 is now complete: all five pieces (Automated Benchmark, A/B
+Routing, Policy Learning, Evolution Engine, Self-healing) are shipped, in
+the dependency order explained above, each with its own review checkpoint.
 
-One of Phase 5's five pieces remains: Self-healing (Automated Benchmark,
-A/B Routing, Policy Learning, and Evolution Engine are done, see
-above) — being built one piece at a time, in the dependency order
-explained above, each with its own review checkpoint. Also still open:
-other tool types beyond
+## What's not implemented yet
+
+Also still open: other tool types beyond
 `web_search`, multi-turn agent loops,
 tool-using agents that act on a plan's own intermediate results mid-run
 rather than a single forced-JSON planning call up front, a real

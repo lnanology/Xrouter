@@ -15,6 +15,7 @@ from app.quota.tracker import QuotaTracker
 from app.reliability.benchmark import BenchmarkScheduler
 from app.reliability.circuit_breaker import CircuitBreakerRegistry
 from app.reliability.health import HealthMonitor
+from app.reliability.self_healer import SelfHealer
 from app.routing.ab_router import ABRouter
 from app.routing.evolution_engine import EvolutionEngine
 from app.routing.performance_controller import PerformanceController
@@ -55,3 +56,4 @@ class AppContext:
     ab_router: ABRouter
     policy_learner: PolicyLearner
     evolution_engine: EvolutionEngine
+    self_healer: SelfHealer

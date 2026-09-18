@@ -67,3 +67,16 @@ evolution:
   interval_seconds: 3600
   evaluation_samples: 20
   rollback_tolerance: 0.02
+
+# Self-healing (Phase 5, last piece): off by default -- the one background
+# task that actually takes provider enable/disable out of human hands.
+# Correlates two signals that already exist for free (HealthMonitor's own
+# health polling + the circuit breaker's live-traffic state) and
+# auto-disables a provider that's looked bad on either for confirm_cycles
+# consecutive checks, auto re-enabling it once it's looked good for
+# confirm_cycles consecutive checks -- never touching a provider an admin
+# disabled directly.
+self_healing:
+  enabled: false
+  interval_seconds: 30
+  confirm_cycles: 3

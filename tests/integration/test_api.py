@@ -224,6 +224,46 @@ def test_admin_evolution_run_once_is_graceful_regardless_of_data(client):
     assert set(body) == {"evaluated", "learn", "pending"}
 
 
+def test_admin_self_healing_status_requires_auth(client):
+    resp = client.get("/admin/self_healing/status")
+    assert resp.status_code == 401
+
+
+def test_admin_self_healing_run_once_requires_auth(client):
+    resp = client.post("/admin/self_healing/run_once")
+    assert resp.status_code == 401
+
+
+def test_admin_self_healing_status_reports_no_managed_providers_on_a_fresh_engine(client):
+    # Same reasoning as Evolution Engine's pending == {} test above:
+    # disabled_by_self_healing is pure in-process state scoped to one
+    # AppContext, never persisted, so a freshly built engine (this test's
+    # own TestClient triggers a fresh startup()) is safe to assert empty.
+    ctx = app.state.context
+    token = ctx.settings.server.admin_token
+    resp = client.get("/admin/self_healing/status", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["enabled"] == ctx.settings.self_healing.enabled
+    assert body["interval_seconds"] == ctx.settings.self_healing.interval_seconds
+    assert body["confirm_cycles"] == ctx.settings.self_healing.confirm_cycles
+    assert body["disabled_by_self_healing"] == {}
+
+
+def test_admin_self_healing_run_once_is_graceful_and_takes_no_action_on_a_fresh_app(client):
+    # A fresh app's real providers start HEALTHY with a CLOSED circuit
+    # (ProviderRegistry.build() seeds HEALTHY at startup), so a single
+    # manual cycle must return 200 with the right shape and no action --
+    # safe to assert the specific empty outcome here too, same reasoning
+    # as the status test above.
+    ctx = app.state.context
+    token = ctx.settings.server.admin_token
+    resp = client.post("/admin/self_healing/run_once", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body == {"actions": {}, "managed": []}
+
+
 def test_request_body_too_large_rejected(client):
     from app.core.config import get_settings
 

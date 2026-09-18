@@ -199,7 +199,7 @@ async def build_test_engine(
     from app.cache.manager import CacheManager
     from app.core.config import (
         ABRoutingConfig, BenchmarkConfig, CacheConfig, EvolutionConfig, PolicyLearningConfig, RoutingConfig,
-        ServerConfig, Settings,
+        SelfHealingConfig, ServerConfig, Settings,
     )
     from app.core.context import AppContext
     from app.core.engine import ChatEngine
@@ -252,7 +252,7 @@ async def build_test_engine(
     settings = Settings(
         server=ServerConfig(), routing=routing, cache=CacheConfig(enabled=False), benchmark=BenchmarkConfig(),
         ab_routing=ab_routing, policy_learning=policy_learning, evolution=EvolutionConfig(),
-        providers={}, raw_routing={},
+        self_healing=SelfHealingConfig(), providers={}, raw_routing={},
     )
 
     metrics_repo = MetricsRepository(db)
@@ -274,7 +274,7 @@ async def build_test_engine(
         provider_repo=ProviderRepository(db), model_repo=ModelRepository(db), request_repo=RequestRepository(db),
         metrics_repo=metrics_repo, health_monitor=None, performance=None, tools=tools,
         memory_repo=MemoryRepository(db), benchmark_scheduler=None, ab_router=ab_router,
-        policy_learner=policy_learner, evolution_engine=None,
+        policy_learner=policy_learner, evolution_engine=None, self_healer=None,
     )
     return ChatEngine(ctx)
 

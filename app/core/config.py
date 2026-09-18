@@ -177,6 +177,26 @@ class EvolutionConfig:
 
 
 @dataclass
+class SelfHealingConfig:
+    """Self-healing (Phase 5's fifth and last piece): off by default --
+    same "must not turn on silently" reasoning as every other opt-in
+    Phase 5 piece, since this is the one background task that actually
+    takes ProviderRegistry.set_enabled() out of human hands. Each cycle
+    correlates two signals that already exist for free (ProviderRegistry.
+    health_of() from HealthMonitor's own polling, and
+    CircuitBreakerRegistry's per-provider state from real request
+    traffic) -- it never re-probes a provider itself. A provider that's
+    looked bad on either signal for confirm_cycles consecutive checks
+    gets auto-disabled; one that's looked good for confirm_cycles
+    consecutive checks while self-disabled gets auto re-enabled. Never
+    touches a provider an admin disabled directly -- see
+    SelfHealer.forget() in app/reliability/self_healer.py."""
+    enabled: bool = False
+    interval_seconds: float = 30.0
+    confirm_cycles: int = 3
+
+
+@dataclass
 class Settings:
     server: ServerConfig
     routing: RoutingConfig
@@ -185,6 +205,7 @@ class Settings:
     ab_routing: ABRoutingConfig
     policy_learning: PolicyLearningConfig
     evolution: EvolutionConfig
+    self_healing: SelfHealingConfig
     providers: dict[str, ProviderConfig]
     raw_routing: dict[str, Any]
     model_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -272,6 +293,13 @@ class Settings:
             rollback_tolerance=float(evolution_raw.get("rollback_tolerance", 0.02)),
         )
 
+        self_healing_raw = raw_config.get("self_healing", {})
+        self_healing = SelfHealingConfig(
+            enabled=bool(self_healing_raw.get("enabled", False)),
+            interval_seconds=float(self_healing_raw.get("interval_seconds", 30.0)),
+            confirm_cycles=int(self_healing_raw.get("confirm_cycles", 3)),
+        )
+
         providers: dict[str, ProviderConfig] = {}
         for pid, pcfg in (raw_providers.get("providers") or {}).items():
             providers[pid] = ProviderConfig(
@@ -309,8 +337,8 @@ class Settings:
 
         return cls(
             server=server, routing=routing, cache=cache, benchmark=benchmark, ab_routing=ab_routing,
-            policy_learning=policy_learning, evolution=evolution, providers=providers, raw_routing=raw_routing,
-            model_overrides=model_overrides, tools=tools,
+            policy_learning=policy_learning, evolution=evolution, self_healing=self_healing, providers=providers,
+            raw_routing=raw_routing, model_overrides=model_overrides, tools=tools,
         )
 
 
