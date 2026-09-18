@@ -157,6 +157,26 @@ class PolicyLearningConfig:
 
 
 @dataclass
+class EvolutionConfig:
+    """Evolution Engine (Phase 5's fourth piece, section 三十六): off by
+    default. Unlike A/B Routing/Policy Learning (config flags that change
+    per-request behavior), this runs its own background timer -- same
+    "must not turn on silently" reasoning as Automated Benchmark. Each
+    cycle: evaluate any pending nudge from a prior cycle against fresh
+    post-nudge evidence (rolling it back if real-world performance got
+    worse), then ask PolicyLearner for a new nudge. Depends on Policy
+    Learning already being enabled: if policy_learning.enabled is False,
+    PolicyLearner.weights_for() never applies anything this computes, so
+    cycles just run against routing that isn't actually using the result
+    -- an expected consequence of the dependency chain, not a bug. See
+    app/routing/evolution_engine.py."""
+    enabled: bool = False
+    interval_seconds: float = 3600.0
+    evaluation_samples: int = 20
+    rollback_tolerance: float = 0.02
+
+
+@dataclass
 class Settings:
     server: ServerConfig
     routing: RoutingConfig
@@ -164,6 +184,7 @@ class Settings:
     benchmark: BenchmarkConfig
     ab_routing: ABRoutingConfig
     policy_learning: PolicyLearningConfig
+    evolution: EvolutionConfig
     providers: dict[str, ProviderConfig]
     raw_routing: dict[str, Any]
     model_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -243,6 +264,14 @@ class Settings:
             quality_weight=float(policy_learning_raw.get("quality_weight", 0.1)),
         )
 
+        evolution_raw = raw_config.get("evolution", {})
+        evolution = EvolutionConfig(
+            enabled=bool(evolution_raw.get("enabled", False)),
+            interval_seconds=float(evolution_raw.get("interval_seconds", 3600.0)),
+            evaluation_samples=int(evolution_raw.get("evaluation_samples", 20)),
+            rollback_tolerance=float(evolution_raw.get("rollback_tolerance", 0.02)),
+        )
+
         providers: dict[str, ProviderConfig] = {}
         for pid, pcfg in (raw_providers.get("providers") or {}).items():
             providers[pid] = ProviderConfig(
@@ -280,7 +309,7 @@ class Settings:
 
         return cls(
             server=server, routing=routing, cache=cache, benchmark=benchmark, ab_routing=ab_routing,
-            policy_learning=policy_learning, providers=providers, raw_routing=raw_routing,
+            policy_learning=policy_learning, evolution=evolution, providers=providers, raw_routing=raw_routing,
             model_overrides=model_overrides, tools=tools,
         )
 

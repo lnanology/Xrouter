@@ -198,7 +198,8 @@ async def build_test_engine(
     production's own default) unless a test opts in."""
     from app.cache.manager import CacheManager
     from app.core.config import (
-        ABRoutingConfig, BenchmarkConfig, CacheConfig, PolicyLearningConfig, RoutingConfig, ServerConfig, Settings,
+        ABRoutingConfig, BenchmarkConfig, CacheConfig, EvolutionConfig, PolicyLearningConfig, RoutingConfig,
+        ServerConfig, Settings,
     )
     from app.core.context import AppContext
     from app.core.engine import ChatEngine
@@ -250,7 +251,8 @@ async def build_test_engine(
     policy_learning = PolicyLearningConfig(**(policy_learning_overrides or {}))
     settings = Settings(
         server=ServerConfig(), routing=routing, cache=CacheConfig(enabled=False), benchmark=BenchmarkConfig(),
-        ab_routing=ab_routing, policy_learning=policy_learning, providers={}, raw_routing={},
+        ab_routing=ab_routing, policy_learning=policy_learning, evolution=EvolutionConfig(),
+        providers={}, raw_routing={},
     )
 
     metrics_repo = MetricsRepository(db)
@@ -272,7 +274,7 @@ async def build_test_engine(
         provider_repo=ProviderRepository(db), model_repo=ModelRepository(db), request_repo=RequestRepository(db),
         metrics_repo=metrics_repo, health_monitor=None, performance=None, tools=tools,
         memory_repo=MemoryRepository(db), benchmark_scheduler=None, ab_router=ab_router,
-        policy_learner=policy_learner,
+        policy_learner=policy_learner, evolution_engine=None,
     )
     return ChatEngine(ctx)
 

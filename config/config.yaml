@@ -55,3 +55,15 @@ policy_learning:
   min_margin: 0.05
   latency_weight_per_second: 0.05
   quality_weight: 0.1
+
+# Evolution Engine (Phase 5): off by default -- runs its own background
+# timer (same reasoning as benchmark.enabled), evaluating each prior
+# nudge against fresh post-nudge evidence and rolling it back if it made
+# things worse, then asking Policy Learning for a new nudge. Depends on
+# policy_learning already being enabled -- otherwise nothing it computes
+# actually reaches real routing.
+evolution:
+  enabled: false
+  interval_seconds: 3600
+  evaluation_samples: 20
+  rollback_tolerance: 0.02

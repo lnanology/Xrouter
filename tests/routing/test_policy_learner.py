@@ -171,6 +171,83 @@ async def test_run_once_compounds_across_repeated_calls(tmp_path):
         assert getattr(second_balanced, f.name) != pytest.approx(getattr(first_balanced, f.name))
 
 
+# --- run_once(exclude=...) --------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_run_once_exclude_prevents_a_qualifying_loser_from_being_nudged(tmp_path):
+    learner, repo = await _build(tmp_path, ["quality", "balanced"], enabled=True)
+    await _seed(repo, "quality", successes=20, failures=0)   # success_rate 1.0
+    await _seed(repo, "balanced", successes=0, failures=20)  # success_rate 0.0 -- would normally be nudged
+
+    result = await learner.run_once(exclude={"balanced"})
+
+    assert result["applied"] is False
+    assert result["adjustments"] == {}
+    assert learner._learned == {}
+
+
+@pytest.mark.asyncio
+async def test_run_once_exclude_still_lets_the_excluded_variant_serve_as_winner_reference(tmp_path):
+    learner, repo = await _build(tmp_path, ["quality", "fastest", "balanced"], enabled=True, min_samples=20)
+    await _seed(repo, "quality", successes=25, failures=0)   # winner overall
+    await _seed(repo, "fastest", successes=0, failures=25)   # excluded as a loser, but still eligible/fitness-tracked
+    await _seed(repo, "balanced", successes=0, failures=25)  # not excluded -- should still get nudged toward quality
+
+    result = await learner.run_once(exclude={"fastest"})
+
+    assert result["applied"] is True
+    assert set(result["adjustments"]) == {"balanced"}
+    assert "fastest" not in learner._learned
+    assert "fastest" in result["fitness"]  # still scored, just not nudged
+
+
+# --- revert() ----------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_revert_with_none_removes_the_override_entirely(tmp_path):
+    learner, repo = await _build(tmp_path, ["quality", "balanced"], enabled=True)
+    await _seed(repo, "quality", successes=20, failures=0)
+    await _seed(repo, "balanced", successes=0, failures=20)
+    await learner.run_once()
+    assert "balanced" in learner._learned
+
+    learner.revert("balanced", None)
+
+    assert "balanced" not in learner._learned
+    base = PolicyWeights(quality=1.0)
+    assert learner.weights_for("balanced", base) is base
+
+
+@pytest.mark.asyncio
+async def test_revert_with_a_dict_restores_the_exact_previous_weights(tmp_path):
+    learner, repo = await _build(tmp_path, ["quality", "balanced"], enabled=True)
+    await _seed(repo, "quality", successes=20, failures=0)
+    await _seed(repo, "balanced", successes=0, failures=20)
+
+    first = await learner.run_once()
+    previous_snapshot = first["adjustments"]["balanced"]["weights"]  # first nudge's resulting weights
+
+    # A second cycle nudges "balanced" again, moving it further from
+    # previous_snapshot -- revert() should restore exactly that earlier state.
+    second = await learner.run_once()
+    assert second["applied"] is True
+    for f in fields(PolicyWeights):
+        assert getattr(learner._learned["balanced"], f.name) != pytest.approx(previous_snapshot[f.name])
+
+    learner.revert("balanced", previous_snapshot)
+
+    restored = learner._learned["balanced"]
+    for f in fields(PolicyWeights):
+        assert getattr(restored, f.name) == pytest.approx(previous_snapshot[f.name])
+
+
+@pytest.mark.asyncio
+async def test_revert_with_none_on_a_policy_with_no_override_is_a_safe_noop(tmp_path):
+    learner, _ = await _build(tmp_path, ["quality", "balanced"], enabled=True)
+    learner.revert("balanced", None)  # no override ever existed -- must not raise
+    assert learner._learned == {}
+
+
 # --- snapshot() ------------------------------------------------------------
 
 @pytest.mark.asyncio

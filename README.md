@@ -957,6 +957,11 @@ Evolution Engine's job (the next piece, described in this same README as
 Policy Learning") — building a second competing scheduler here would be
 exactly the unneeded infrastructure this project's own rules forbid.
 
+(`run_once()` also records, per nudge, the loser's pre-nudge fitness and
+its previous weights snapshot — not used by anything in this piece itself,
+but exactly what Evolution Engine, described next, needs to later judge
+whether that nudge actually helped.)
+
 Each eligible variant (one of `ab_routing.variants` with at least
 `policy_learning.min_samples` recorded outcomes) gets one transparent
 fitness score:
@@ -1008,6 +1013,67 @@ a table) in this first version — if Evolution Engine later needs them to
 survive a restart, that's its own extension point, not built ahead of
 need.
 
+### Evolution Engine (Phase 5, opt-in: `evolution.enabled` in `config.yaml`)
+
+Phase 5's fourth piece. Policy Learning (above) computes one honest
+adjustment step but deliberately doesn't decide *when* to run, or check
+whether a nudge it already made actually helped once real traffic ran
+under the new weights — that's this piece. `EvolutionEngine` is a
+background loop (same `start()`/`_loop()`/`stop()` shape as
+`BenchmarkScheduler`) that each cycle: (1) evaluates every nudge still
+pending from a prior cycle against fresh post-nudge evidence, rolling it
+back via `PolicyLearner.revert()` if real-world performance came in worse
+than before the nudge; (2) asks `PolicyLearner.run_once()` for a fresh
+nudge, excluding any policy still awaiting evaluation from (1) so the same
+policy can never be nudged twice before anyone's checked whether the
+first nudge even helped; (3) records any brand-new adjustment into its
+own pending set for the next cycle to evaluate.
+
+Evaluation reuses `MetricsRepository.ab_summary(since=...)` — a pure
+additive time filter on the existing `ab_results` table, no new
+schema — to compute fitness (via `PolicyLearner`'s own public `fitness()`
+method, so the nudge decision and the rollback evaluation can never drift
+out of formula-sync with each other) over only the outcomes recorded
+*after* the nudge was applied, compared against the fitness at the moment
+of the nudge:
+
+```
+new_fitness < baseline_fitness - evolution.rollback_tolerance  ->  revert
+otherwise                                                       ->  confirm (leave as nudged)
+```
+
+`evolution.rollback_tolerance` (default `0.02`) is deliberately smaller
+than `policy_learning.min_margin` (default `0.05`) — confirming a nudge
+helped should be *easier* to fail than the original nudge was to trigger,
+since a bad nudge is actively hurting live routing right now, while a
+skipped nudge just leaves things unchanged.
+
+This is genuine "variation, evaluation, retention-or-reversion," not a
+fake wrapper that calls `run_once()` on a timer with no real evaluation
+step. It's also an honest limitation, not a rigorous causal test: this is
+a pre/post comparison on the same policy across time, and real-world
+traffic can drift for unrelated reasons too — the same way A/B Routing's
+anonymous-caller limitation is documented above rather than glossed over.
+
+```bash
+curl "http://localhost:20128/admin/evolution/status" -H "Authorization: Bearer $TOKEN"
+curl -X POST http://localhost:20128/admin/evolution/run_once -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{ "enabled": true, "interval_seconds": 3600,
+  "pending": { "balanced": { "applied_at": 1234567890.1, "previous_weights": null, "baseline_fitness": 0.42 } } }
+```
+
+Off by default (`evolution.enabled: false`) — it runs its own background
+timer, same "must not turn on silently" reasoning as Automated Benchmark.
+It also has a real dependency on Policy Learning already being enabled:
+if `policy_learning.enabled` is false, `PolicyLearner.weights_for()` never
+applies anything this engine computes, so cycles run against routing that
+isn't actually using the result — an expected consequence of the
+dependency chain, not a bug in this piece. Pending state lives in memory
+only, scoped to one process, same as Policy Learning's learned overrides.
+
 ## Tests
 
 ```bash
@@ -1015,7 +1081,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-385 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+404 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -1247,7 +1313,29 @@ with no `policy_learner` supplied at all; and, full stack, both new
 other `/admin/*` route, `GET .../weights` reporting the real running
 `enabled`/`variants` config, and `POST .../relearn` always returning 200
 with an `applied` key present regardless of how much real data exists to
-act on.
+act on. Evolution Engine (`tests/routing/test_evolution_engine.py`,
+`tests/routing/test_policy_learner.py`, `tests/integration/test_api.py`)
+— `run_once()` recording a fresh nudge into `pending` with the correct
+pre-nudge `baseline_fitness`/`previous_weights`; a pending entry staying
+pending, untouched, across repeated calls when there's no fresh evidence
+yet, with `exclude` threading through to `PolicyLearner.run_once()` so it
+isn't nudged again in the meantime (and a separate direct test confirming
+`PolicyLearner.run_once(exclude=...)` itself skips a qualifying loser
+while still letting it serve as a winner reference for others);
+`_evaluate_pending()` confirming (leaving weights untouched) when fresh
+fitness holds up, and reverting via `PolicyLearner.revert()` when it drops
+past `rollback_tolerance` — including the `previous_weights=None` case
+(a first-ever nudge) correctly removing the override entirely rather than
+restoring a bogus snapshot; `PolicyLearner.revert()` itself tested in
+isolation for both the dict-restore and `None`-removal paths;
+`start()`/`stop()` lifecycle mirroring `BenchmarkScheduler`'s own tested
+shape; `snapshot()`'s shape; and, full stack, both new
+`/admin/evolution/*` routes requiring the same admin token as every other
+`/admin/*` route, `GET .../status` reporting `pending == {}` on a freshly
+built engine (safe here since pending is pure in-process state, unlike
+the persisted-DB reads above), and `POST .../run_once` always returning
+200 with the `evaluated`/`learn`/`pending` keys present regardless of how
+much real data exists to act on.
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -1479,11 +1567,22 @@ Plugs into the one existing weights-lookup point,
 /admin/policy_learning/{weights,relearn}`. See the Policy Learning section
 above for the full fitness/nudge design and its honest dependency on A/B
 Routing already being enabled and trafficked.
+Evolution Engine (`app/routing/evolution_engine.py`, `app/api/admin.py`)
+— the fourth piece. A background loop (same hand-rolled shape as
+`BenchmarkScheduler`) that evaluates each prior cycle's nudge against
+fresh post-nudge evidence — rolling it back via `PolicyLearner.revert()`
+if it made things worse — before asking `PolicyLearner.run_once()` for a
+fresh one, excluding any policy still awaiting evaluation. Genuine
+"variation, evaluation, retention-or-reversion," off by default, over
+`GET/POST /admin/evolution/{status,run_once}`. See the Evolution Engine
+section above for the full design, its honest dependency on Policy
+Learning already being enabled, and why it's a real (if imperfect)
+evaluation rather than a fake scheduled wrapper.
 
 ## What's not implemented yet (by design — see Phase 5 in the spec)
 
-Two of Phase 5's five pieces remain: Evolution Engine and Self-healing
-(Automated Benchmark, A/B Routing, and Policy Learning are done, see
+One of Phase 5's five pieces remains: Self-healing (Automated Benchmark,
+A/B Routing, Policy Learning, and Evolution Engine are done, see
 above) — being built one piece at a time, in the dependency order
 explained above, each with its own review checkpoint. Also still open:
 other tool types beyond

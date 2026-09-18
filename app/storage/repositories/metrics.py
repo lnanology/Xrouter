@@ -79,18 +79,32 @@ class MetricsRepository:
         except Exception as e:
             logger.warning("record_ab_result failed: %s", e)
 
-    async def ab_summary(self) -> dict[str, dict]:
+    async def ab_summary(self, since: float | None = None) -> dict[str, dict]:
         """One row per variant: {count, success_rate, avg_latency_ms,
         avg_quality_score}. AVG() over a nullable column (latency_ms,
         quality_score) already skips NULLs in SQLite, so a variant with some
         rows missing a quality score still gets a meaningful average over
-        the rows that have one, rather than the whole aggregate going NULL."""
+        the rows that have one, rather than the whole aggregate going NULL.
+
+        `since`: when given, only rows with recorded_at >= since are
+        aggregated -- lets a caller ask "what's happened since a given
+        moment" (Evolution Engine, app/routing/evolution_engine.py, uses
+        this to evaluate a nudge's post-nudge performance). Omitted
+        (the default), this is the exact same all-time query every
+        existing caller already relies on."""
         try:
             async with self._db.connect() as conn:
-                cursor = await conn.execute(
-                    "SELECT variant, COUNT(*), AVG(success), AVG(latency_ms), AVG(quality_score)"
-                    " FROM ab_results GROUP BY variant"
-                )
+                if since is None:
+                    cursor = await conn.execute(
+                        "SELECT variant, COUNT(*), AVG(success), AVG(latency_ms), AVG(quality_score)"
+                        " FROM ab_results GROUP BY variant"
+                    )
+                else:
+                    cursor = await conn.execute(
+                        "SELECT variant, COUNT(*), AVG(success), AVG(latency_ms), AVG(quality_score)"
+                        " FROM ab_results WHERE recorded_at >= ? GROUP BY variant",
+                        (since,),
+                    )
                 rows = await cursor.fetchall()
                 return {
                     r[0]: {

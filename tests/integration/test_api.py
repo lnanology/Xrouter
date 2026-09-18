@@ -185,6 +185,45 @@ def test_admin_policy_learning_relearn_is_graceful_regardless_of_data(client):
     assert "applied" in resp.json()
 
 
+def test_admin_evolution_status_requires_auth(client):
+    resp = client.get("/admin/evolution/status")
+    assert resp.status_code == 401
+
+
+def test_admin_evolution_run_once_requires_auth(client):
+    resp = client.post("/admin/evolution/run_once")
+    assert resp.status_code == 401
+
+
+def test_admin_evolution_status_reports_pending_on_a_fresh_engine(client):
+    # Unlike ab_results/learned_overrides (persisted in the real DB across
+    # runs), EvolutionEngine.pending is pure in-process state scoped to one
+    # AppContext -- this test's own TestClient triggers a fresh startup(),
+    # so a freshly-built engine has never recorded a nudge and asserting
+    # emptiness here is safe (unlike the persisted-DB reads above).
+    ctx = app.state.context
+    token = ctx.settings.server.admin_token
+    resp = client.get("/admin/evolution/status", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["enabled"] == ctx.settings.evolution.enabled
+    assert body["interval_seconds"] == ctx.settings.evolution.interval_seconds
+    assert body["pending"] == {}
+
+
+def test_admin_evolution_run_once_is_graceful_regardless_of_data(client):
+    # A manual cycle must always return 200 with the top-level shape,
+    # whether or not there's enough real ab_results/pending-nudge data to
+    # act on -- never a specific outcome asserted, same reasoning as the
+    # policy_learning relearn smoke test above.
+    ctx = app.state.context
+    token = ctx.settings.server.admin_token
+    resp = client.post("/admin/evolution/run_once", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    body = resp.json()
+    assert set(body) == {"evaluated", "learn", "pending"}
+
+
 def test_request_body_too_large_rejected(client):
     from app.core.config import get_settings
 

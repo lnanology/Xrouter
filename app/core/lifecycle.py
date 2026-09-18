@@ -15,6 +15,7 @@ from app.reliability.benchmark import BenchmarkScheduler
 from app.reliability.circuit_breaker import CircuitBreakerRegistry
 from app.reliability.health import HealthMonitor
 from app.routing.ab_router import ABRouter
+from app.routing.evolution_engine import EvolutionEngine
 from app.routing.performance_controller import PerformanceController
 from app.routing.policy_learner import PolicyLearner
 from app.routing.router import AdaptiveRouter
@@ -91,6 +92,15 @@ async def startup(settings: Settings | None = None) -> AppContext:
     if settings.benchmark.enabled:
         benchmark_scheduler.start()
 
+    evolution_engine = EvolutionEngine(
+        policy_learner, metrics_repo, enabled=settings.evolution.enabled,
+        interval_seconds=settings.evolution.interval_seconds,
+        evaluation_samples=settings.evolution.evaluation_samples,
+        rollback_tolerance=settings.evolution.rollback_tolerance,
+    )
+    if settings.evolution.enabled:
+        evolution_engine.start()
+
     ab_router = ABRouter(settings.ab_routing.variants, metrics_repo, enabled=settings.ab_routing.enabled)
 
     tools = build_tool_registry(settings)
@@ -107,7 +117,7 @@ async def startup(settings: Settings | None = None) -> AppContext:
         provider_repo=provider_repo, model_repo=model_repo, request_repo=request_repo,
         metrics_repo=metrics_repo, health_monitor=health_monitor, performance=performance, tools=tools,
         memory_repo=memory_repo, benchmark_scheduler=benchmark_scheduler, ab_router=ab_router,
-        policy_learner=policy_learner,
+        policy_learner=policy_learner, evolution_engine=evolution_engine,
     )
 
 
@@ -116,6 +126,7 @@ async def shutdown(ctx: AppContext) -> None:
     await ctx.health_monitor.stop()
     await ctx.performance.stop()
     await ctx.benchmark_scheduler.stop()
+    await ctx.evolution_engine.stop()
     await ctx.providers.close_all()
     await ctx.tools.close_all()
     logger.info("shutdown complete")

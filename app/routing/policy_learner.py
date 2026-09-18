@@ -63,7 +63,11 @@ class PolicyLearner:
             return base
         return self._learned.get(policy_key, base)
 
-    def _fitness(self, row: dict) -> float:
+    def fitness(self, row: dict) -> float:
+        """Public: Evolution Engine (app/routing/evolution_engine.py)
+        reuses this exact instance method to evaluate a nudge's post-nudge
+        performance, so the nudge decision and the later rollback
+        evaluation can never drift out of formula-sync with each other."""
         success_rate = row.get("success_rate") or 0.0
         avg_latency_ms = row.get("avg_latency_ms") or 0.0
         avg_quality_score = row.get("avg_quality_score") or 0.0
@@ -73,12 +77,20 @@ class PolicyLearner:
             - self._latency_weight_per_second * (avg_latency_ms / 1000.0)
         )
 
-    async def run_once(self) -> dict:
+    async def run_once(self, exclude: set[str] | None = None) -> dict:
         """Computes (and, for any loser whose margin clears the threshold,
         stores) one adjustment step from the current ab_results. Always
         safe to call, even when disabled -- a disabled learner still
         computes and stores overrides here (a preview), it's weights_for()
-        above that gates whether real routing actually uses them."""
+        above that gates whether real routing actually uses them.
+
+        `exclude`: policy keys that must never be nudged as a loser this
+        call (still included in fitness/eligible so they can still serve
+        as a winner reference for others). Evolution Engine passes in
+        every policy it's still waiting to evaluate from a prior nudge --
+        without this, the same policy could get nudged again before
+        anyone checked whether the first nudge even helped."""
+        exclude = exclude or set()
         summary = await self._repo.ab_summary()
         eligible = {
             v: summary[v] for v in self._variants
@@ -90,12 +102,12 @@ class PolicyLearner:
                 "eligible_variants": sorted(eligible), "min_samples": self._min_samples,
             }
 
-        fitness = {v: self._fitness(row) for v, row in eligible.items()}
+        fitness = {v: self.fitness(row) for v, row in eligible.items()}
         winner = max(fitness, key=fitness.get)
 
         adjustments: dict[str, dict] = {}
         for loser in eligible:
-            if loser == winner:
+            if loser == winner or loser in exclude:
                 continue
             margin = fitness[winner] - fitness[loser]
             if margin < self._min_margin:
@@ -104,16 +116,34 @@ class PolicyLearner:
 
             winner_current = self._learned.get(winner, POLICY_WEIGHTS.get(winner, POLICY_WEIGHTS["balanced"]))
             loser_base = POLICY_WEIGHTS.get(loser, POLICY_WEIGHTS["balanced"])
-            loser_current = self._learned.get(loser, loser_base)
+            prior_override = self._learned.get(loser)  # None means "no override existed before this call"
+            loser_current = prior_override if prior_override is not None else loser_base
 
             new_weights = _nudge(loser_current, winner_current, self._learning_rate)
             self._learned[loser] = new_weights
             adjustments[loser] = {
-                "toward": winner, "margin": margin,
+                "toward": winner, "margin": margin, "fitness_before": fitness[loser],
+                "previous_weights": (
+                    {f.name: getattr(prior_override, f.name) for f in fields(PolicyWeights)}
+                    if prior_override is not None else None
+                ),
                 "weights": {f.name: getattr(new_weights, f.name) for f in fields(PolicyWeights)},
             }
 
         return {"applied": bool(adjustments), "fitness": fitness, "adjustments": adjustments}
+
+    def revert(self, policy_key: str, weights: dict | None) -> None:
+        """Restores policy_key's learned override to a previous state --
+        None removes any override entirely (weights_for() falls back to
+        the static base again); a dict (the same shape run_once()'s
+        adjustments[...]["previous_weights"]/["weights"] already return)
+        reconstructs and restores that exact PolicyWeights. Used by
+        Evolution Engine's rollback guardrail when a nudge's real-world
+        post-nudge performance came in worse than before."""
+        if weights is None:
+            self._learned.pop(policy_key, None)
+        else:
+            self._learned[policy_key] = PolicyWeights(**weights)
 
     def snapshot(self) -> dict:
         return {

@@ -92,6 +92,24 @@ async def admin_policy_learning_relearn(request: Request):
     return await ctx.policy_learner.run_once()
 
 
+@router.get("/evolution/status", dependencies=[Depends(require_admin)])
+async def admin_evolution_status(request: Request):
+    """Current pending-nudge state -- see EvolutionEngine.snapshot()."""
+    ctx = request.app.state.context
+    return ctx.evolution_engine.snapshot()
+
+
+@router.post("/evolution/run_once", dependencies=[Depends(require_admin)])
+async def admin_evolution_run_once(request: Request):
+    """Manually triggers one full EvolutionEngine cycle (evaluate any
+    pending nudge, then ask Policy Learning for a fresh one), regardless
+    of whether evolution.enabled gates the background schedule -- same
+    "manual trigger works independent of the schedule switch" precedent
+    as POST /admin/benchmark and POST /admin/policy_learning/relearn."""
+    ctx = request.app.state.context
+    return await ctx.evolution_engine.run_once()
+
+
 @router.post("/reload", dependencies=[Depends(require_admin)])
 async def admin_reload(request: Request):
     ctx = request.app.state.context

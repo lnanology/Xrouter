@@ -16,6 +16,7 @@ from app.reliability.benchmark import BenchmarkScheduler
 from app.reliability.circuit_breaker import CircuitBreakerRegistry
 from app.reliability.health import HealthMonitor
 from app.routing.ab_router import ABRouter
+from app.routing.evolution_engine import EvolutionEngine
 from app.routing.performance_controller import PerformanceController
 from app.routing.policy_learner import PolicyLearner
 from app.routing.router import AdaptiveRouter
@@ -53,3 +54,4 @@ class AppContext:
     benchmark_scheduler: BenchmarkScheduler
     ab_router: ABRouter
     policy_learner: PolicyLearner
+    evolution_engine: EvolutionEngine
