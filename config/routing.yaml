@@ -7,6 +7,12 @@ routing:
   quality_gate_enabled: false   # optional; off by default, a failed gate costs an extra provider call
   quality_gate_min_score: 0.5   # response.xrouter.quality.score below this fails the gate
   max_quality_retries: 1        # how many untried candidates to retry through on a failed gate
+  quality_gate_llm_grading_enabled: false  # optional; nested inside quality_gate_enabled above -- a
+                                             # second real LLM call to judge correctness, only run after
+                                             # the (free) structural check already passed. Off by default
+                                             # even when the structural gate is on: a real extra provider
+                                             # call per assessment must never turn on silently.
+  quality_gate_judge_policy: quality        # routing policy used for the LLM judge call itself
   max_dag_nodes: 20              # cap on nodes in a single POST /v1/dag/run request
   planner_routing_policy: quality  # routing policy used for the Planner's own planning call
   max_plan_retries: 2              # how many times the Planner re-prompts on an invalid/unrunnable plan

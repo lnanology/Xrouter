@@ -213,7 +213,52 @@ what happened:
 }
 ```
 
-**Streaming requests never run the quality gate**, and this is a
+**LLM-graded judgment** is the second, opt-in half of the gate —
+`routing.quality_gate_llm_grading_enabled` (default `false`), nested
+*inside* `quality_gate_enabled`, since it only ever runs on top of an
+already-opt-in feature. Once both are on, a response that already passed
+the free structural check above gets a real second opinion: XRouter asks
+another model — via a forced `submit_quality_judgment` tool call, the same
+pattern the Critic and Verifier (below) already use — whether the response
+is actually accurate, complete, and on-topic, not just well-formed. A
+"not satisfied" verdict is treated exactly like a structural failure and
+retries the next untried candidate through the same `max_quality_retries`
+budget (no separate cap); the feedback comes back on
+`xrouter.quality.llm_feedback`:
+
+```json
+"quality": {"score": 1.0, "passed": false, "reasons": ["llm_graded_unsatisfactory"], "llm_feedback": "Cites the wrong year for the treaty."}
+```
+
+The judge call runs under its own routing policy,
+`routing.quality_gate_judge_policy` (default `"quality"`, independent of
+whatever policy the original request used — same reasoning as the
+Planner's own dedicated `planner_routing_policy`), and prefers a provider
+different from the one that actually answered when the ranked candidate
+list offers one, to avoid a model grading its own homework. A structurally
+broken response never reaches this step at all — no point paying for a
+second opinion on an empty or truncated answer — and the judge call itself
+fails open (a missing/malformed tool call, or no available judge candidate
+at all, counts as satisfied) rather than ever blocking a response that
+already passed the cheap check. **Cost note**: with this on, a
+structural-pass-but-LLM-fail retry costs *two* extra provider calls per
+attempt (the retried candidate, plus its own judge call) — `quality_gate_enabled`
+alone already costs one extra call per failed structural retry, so this is
+a genuine multiplier, which is exactly why it's a separate, nested,
+off-by-default switch rather than bundled into `quality_gate_enabled`
+itself.
+
+One architectural note for anyone reading `app/core/engine.py`: unlike the
+Critic/Verifier judge calls (which route through the normal
+`ChatEngine.handle_chat`), this judge call deliberately bypasses
+`handle_chat` and calls the router + `run_chat` directly. It has to —
+this call happens *from inside* the quality gate itself, so routing it
+back through `handle_chat` would re-enter the gate for the judge's own
+response and, with LLM grading on, try to grade the judge's grading,
+unboundedly.
+
+**Streaming requests never run the quality gate** (structural or
+LLM-graded), and this is a
 deliberate, permanent scope decision rather than a gap waiting to be
 filled — see `app/intelligence/quality_gate.py`'s module docstring for the
 full reasoning. In short: a streamed response is already being sent to
@@ -1183,7 +1228,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-434 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+451 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -1205,8 +1250,15 @@ by `run_stream_race` even though `run_stream_chat` deliberately still
 doesn't log them), the
 quality gate (empty/truncated/degenerate-repetition/missing-forced-
 tool-call detection, retry-to-next-untried-candidate, best-effort return
-when every candidate still fails, `quality.failed` events, and the
-`max_quality_retries: 0` no-retry-but-still-assess case), and the DAG
+when every candidate still fails, `quality.failed` events, the
+`max_quality_retries: 0` no-retry-but-still-assess case, and its opt-in
+LLM-graded layer: judge skipped entirely when grading is off, a
+structurally-good response left alone when the judge is satisfied, a
+retry to the next candidate sharing the same budget when it isn't,
+`llm_graded_unsatisfactory`/`llm_feedback` in the final result, the
+judge preferring a provider different from the one that answered,
+and falling open when the judge has no available candidate or fails
+outright), and the DAG
 executor (wave/topological ordering, validation errors for empty/
 too-many/duplicate/self-dependent/unknown-dependency/cyclic graphs,
 placeholder substitution incl. unknown-placeholder passthrough and
@@ -1518,7 +1570,13 @@ degenerate word/character repetition, missing forced tool call) that
 retries a below-threshold response with the next untried candidate, up to
 `max_quality_retries` times, always attaching the assessment to
 `xrouter.quality` and never erroring out even if nothing better is found.
-DAG Executor (`app/execution/dag.py`, `app/contracts/dag.py`,
+Optionally extended with LLM-graded judgment (nested opt-in:
+`routing.quality_gate_llm_grading_enabled`) — a real second model call,
+via a forced `submit_quality_judgment` tool call mirroring the Critic/
+Verifier pattern, that actually judges correctness rather than just
+structure, sharing the same retry budget and falling open on any error;
+runs under its own `quality_gate_judge_policy` and prefers a provider
+different from the one that answered when possible. DAG Executor (`app/execution/dag.py`, `app/contracts/dag.py`,
 `POST /v1/dag/run`) — executes a client-supplied explicit graph of chat-
 completion nodes in topologically-ordered concurrent waves (Kahn's
 algorithm), substituting `{{node_id}}` placeholders with upstream node
@@ -1740,16 +1798,18 @@ tool-using agents that act on a plan's own intermediate results mid-run
 rather than a single forced-JSON planning call up front, a real
 embeddings-backed `Retriever` (Memory/RAG is keyword-based today, by
 design — see above), plugin loader, browser/web-AI adapter, network
-failover/VPN layer, PostgreSQL migration, and LLM-graded (as opposed to
-structural) quality assessment. Race mode now covers streaming too (see
-above); the quality gate remains **deliberately** non-streaming-only —
-not a gap, a permanent scope decision (a streamed response has already
-reached the client chunk by chunk by the time it could be assessed, so
-there's nothing left to retry; see `app/intelligence/quality_gate.py`'s
-docstring and the Quality gate section above for the full reasoning and
-the alternatives considered). Their directories exist as reserved, empty
-packages (`app/execution/cancellation.py`, `app/network`, `app/plugins`)
-so the rest of Phase 5+ has a home without restructuring what's already
+failover/VPN layer, and PostgreSQL migration. Race mode covers streaming
+too, and the Quality Gate now has an opt-in LLM-graded judgment layer on
+top of its structural checks (see above for both) — the quality gate as a
+whole remains **deliberately** non-streaming-only regardless, structural
+or LLM-graded — not a gap, a permanent scope decision (a streamed response
+has already reached the client chunk by chunk by the time it could be
+assessed, so there's nothing left to retry; see
+`app/intelligence/quality_gate.py`'s docstring and the Quality gate
+section above for the full reasoning and the alternatives considered).
+Their directories exist as reserved, empty packages
+(`app/execution/cancellation.py`, `app/network`, `app/plugins`) so the
+rest of Phase 5+ has a home without restructuring what's already
 built.
 
 ## Project layout

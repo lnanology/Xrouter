@@ -55,6 +55,18 @@ class RoutingConfig:
     quality_gate_enabled: bool = False
     quality_gate_min_score: float = 0.5
     max_quality_retries: int = 1
+    # LLM-graded judgment (app/intelligence/quality_gate.py): a second real
+    # LLM call that actually judges correctness, not just structure. Off by
+    # default even when quality_gate_enabled is on -- nested inside that
+    # switch, so it only ever fires on top of an already-opt-in feature,
+    # and only after the cheap structural check already passed. Shares
+    # max_quality_retries above; no separate retry cap. quality_gate_judge_policy
+    # is the routing policy used for the judge call itself (independent of
+    # the original request's own policy) -- "quality" by default, the same
+    # reasoning as planner_routing_policy below: a weak judge undermines
+    # the whole point of grading.
+    quality_gate_llm_grading_enabled: bool = False
+    quality_gate_judge_policy: str = "quality"
     # DAG Executor (Phase 2): caps how many nodes a single client-submitted
     # DAG may contain, so one request can't fan out into an unbounded
     # number of provider calls.
@@ -244,6 +256,8 @@ class Settings:
             quality_gate_enabled=bool(routing_raw.get("quality_gate_enabled", False)),
             quality_gate_min_score=float(routing_raw.get("quality_gate_min_score", 0.5)),
             max_quality_retries=int(routing_raw.get("max_quality_retries", 1)),
+            quality_gate_llm_grading_enabled=bool(routing_raw.get("quality_gate_llm_grading_enabled", False)),
+            quality_gate_judge_policy=routing_raw.get("quality_gate_judge_policy", "quality"),
             max_dag_nodes=int(routing_raw.get("max_dag_nodes", 20)),
             planner_routing_policy=routing_raw.get("planner_routing_policy", "quality"),
             max_plan_retries=int(routing_raw.get("max_plan_retries", 2)),

@@ -1,6 +1,8 @@
+import json
+
 from app.contracts.request import ChatCompletionRequest, ChatMessage
 from app.contracts.response import ChatCompletionChoice, ChatCompletionResponse, Usage
-from app.intelligence.quality_gate import assess
+from app.intelligence.quality_gate import LLM_QUALITY_TOOL_NAME, assess, build_llm_judge_request, parse_llm_judgment
 
 
 def _req(tool_choice=None):
@@ -89,3 +91,63 @@ def test_custom_min_score_threshold():
     resp = _resp("a reasonably long and complete-looking answer", finish_reason="length")
     assert assess(resp, _req(), min_score=0.5).passed is True
     assert assess(resp, _req(), min_score=0.8).passed is False
+
+
+# --- build_llm_judge_request / parse_llm_judgment (LLM-graded judgment) -----
+
+def test_build_llm_judge_request_forces_the_judgment_tool():
+    req = build_llm_judge_request(_req(), _resp("The capital of France is Paris."), routing_policy="quality")
+    assert req is not None
+    assert req.tool_choice == {"type": "function", "function": {"name": LLM_QUALITY_TOOL_NAME}}
+    assert req.tools[0]["function"]["name"] == LLM_QUALITY_TOOL_NAME
+    assert req.routing_policy == "quality"
+    # The candidate response's own text must actually appear in the judge prompt.
+    assert any("Paris" in (m.content or "") for m in req.messages)
+
+
+def test_build_llm_judge_request_returns_none_for_tool_call_only_response():
+    resp = _resp("", tool_calls=[{"id": "call_1", "type": "function", "function": {"name": "get_weather", "arguments": "{}"}}])
+    assert build_llm_judge_request(_req(), resp, routing_policy=None) is None
+
+
+def test_parse_llm_judgment_satisfied():
+    judge_resp = _resp("", tool_calls=[{
+        "id": "call_1", "type": "function",
+        "function": {"name": LLM_QUALITY_TOOL_NAME, "arguments": json.dumps({"satisfied": True, "feedback": ""})},
+    }])
+    result = parse_llm_judgment(judge_resp)
+    assert result.satisfied is True
+    assert result.feedback is None
+
+
+def test_parse_llm_judgment_unsatisfied_with_feedback():
+    judge_resp = _resp("", tool_calls=[{
+        "id": "call_1", "type": "function",
+        "function": {"name": LLM_QUALITY_TOOL_NAME, "arguments": json.dumps({"satisfied": False, "feedback": "Wrong capital."})},
+    }])
+    result = parse_llm_judgment(judge_resp)
+    assert result.satisfied is False
+    assert result.feedback == "Wrong capital."
+
+
+def test_parse_llm_judgment_fails_open_on_missing_tool_call():
+    result = parse_llm_judgment(_resp("I'm not sure how to judge that."))
+    assert result.satisfied is True
+    assert result.feedback is None
+
+
+def test_parse_llm_judgment_fails_open_on_malformed_json():
+    judge_resp = _resp("", tool_calls=[{
+        "id": "call_1", "type": "function", "function": {"name": LLM_QUALITY_TOOL_NAME, "arguments": "{not valid json"},
+    }])
+    result = parse_llm_judgment(judge_resp)
+    assert result.satisfied is True
+
+
+def test_parse_llm_judgment_fails_open_on_missing_satisfied_key():
+    judge_resp = _resp("", tool_calls=[{
+        "id": "call_1", "type": "function",
+        "function": {"name": LLM_QUALITY_TOOL_NAME, "arguments": json.dumps({"feedback": "no verdict field"})},
+    }])
+    result = parse_llm_judgment(judge_resp)
+    assert result.satisfied is True

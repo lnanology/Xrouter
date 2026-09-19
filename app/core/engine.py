@@ -14,6 +14,12 @@ from app.contracts.router import RoutingDecision
 from app.core.context import AppContext
 from app.core.errors import NoAvailableModelError
 from app.execution.race import run_race, run_stream_race
+from app.intelligence.quality_gate import (
+    LLMQualityJudgment,
+    QualityAssessment,
+    build_llm_judge_request,
+    parse_llm_judgment,
+)
 from app.intelligence.quality_gate import assess as assess_quality
 from app.intelligence.task_classifier import TaskClassification, classify
 from app.observability.logging import get_logger
@@ -66,6 +72,66 @@ class ChatEngine:
         per-request opt-in, but for request.stream=True instead."""
         return bool(self.ctx.settings.routing.race_mode_enabled and request.race and request.stream)
 
+    async def _assess_response(self, response: ChatCompletionResponse, request: ChatCompletionRequest) -> QualityAssessment:
+        """Structural check first (cheap, always run when the gate is on);
+        LLM-graded judgment second (a real extra provider call), only when
+        routing.quality_gate_llm_grading_enabled is also on AND the
+        structural check already passed -- a structurally broken response
+        doesn't need a second opinion. See app/intelligence/quality_gate.py's
+        module docstring for the full design."""
+        min_score = self.ctx.settings.routing.quality_gate_min_score
+        assessment = assess_quality(response, request, min_score=min_score)
+        if assessment.passed and self.ctx.settings.routing.quality_gate_llm_grading_enabled:
+            judgment = await self._run_llm_quality_judge(response, request)
+            if not judgment.satisfied:
+                assessment = QualityAssessment(
+                    passed=False, score=assessment.score,
+                    reasons=[*assessment.reasons, "llm_graded_unsatisfactory"],
+                    llm_feedback=judgment.feedback,
+                )
+        return assessment
+
+    async def _run_llm_quality_judge(self, response: ChatCompletionResponse, request: ChatCompletionRequest) -> LLMQualityJudgment:
+        """Bypasses handle_chat entirely and calls the router + run_chat
+        directly instead, exactly like _apply_quality_gate's own
+        candidate-retry logic below already does. This is required, not
+        stylistic: this method runs *from inside* _apply_quality_gate, so
+        routing the judge call back through handle_chat would re-enter
+        _apply_quality_gate for the judge's own response and, since LLM
+        grading is on for this to even be called, try to grade the judge's
+        grading -- unboundedly. Never raises: falls open (satisfied=True)
+        on no available judge candidate, exactly like Critic/Verifier do
+        for their own judge calls."""
+        policy = self.ctx.settings.routing.quality_gate_judge_policy
+        judge_request = build_llm_judge_request(request, response, routing_policy=policy)
+        if judge_request is None:
+            return LLMQualityJudgment(satisfied=True)
+        try:
+            decision = self.ctx.router.select(judge_request, policy)
+        except NoAvailableModelError:
+            return LLMQualityJudgment(satisfied=True)
+        decision = self._prefer_different_provider(decision, response.xrouter.get("provider") if response.xrouter else None)
+        try:
+            judge_response, _ = await run_chat(
+                decision, self.ctx.providers, self.ctx.circuits, self.ctx.quota, self.ctx.limiter,
+                judge_request, len(decision.fallback_chain) + 1, performance=self.ctx.performance,
+            )
+        except NoAvailableModelError:
+            return LLMQualityJudgment(satisfied=True)
+        return parse_llm_judgment(judge_response)
+
+    def _prefer_different_provider(self, decision: RoutingDecision, exclude_provider_id: str | None) -> RoutingDecision:
+        """Avoids a model grading its own answer when a genuine alternative
+        exists in the same ranked candidate list; proceeds with the same
+        provider rather than skip grading if there's no alternative."""
+        if exclude_provider_id is None or decision.primary.provider_id != exclude_provider_id:
+            return decision
+        for i, candidate in enumerate(decision.fallback_chain):
+            if candidate.provider_id != exclude_provider_id:
+                rest = decision.fallback_chain[:i] + [decision.primary] + decision.fallback_chain[i + 1:]
+                return RoutingDecision(primary=candidate, fallback_chain=rest, policy=decision.policy)
+        return decision
+
     async def _apply_quality_gate(
         self, decision: RoutingDecision, request: ChatCompletionRequest,
         response: ChatCompletionResponse, attempts: list[dict],
@@ -74,12 +140,11 @@ class ChatEngine:
         raises: if every untried candidate is exhausted (or also fails the
         gate) it returns the best response found so far, with the final
         assessment attached to xrouter.quality either way."""
-        min_score = self.ctx.settings.routing.quality_gate_min_score
         max_retries = self.ctx.settings.routing.max_quality_retries
         all_candidates = [decision.primary, *decision.fallback_chain]
 
         retries = 0
-        assessment = assess_quality(response, request, min_score=min_score)
+        assessment = await self._assess_response(response, request)
         while not assessment.passed and retries < max_retries:
             self.ctx.events.emit("quality.failed", {"reasons": assessment.reasons, "score": assessment.score})
             tried = {(a["provider_id"], a.get("model_id")) for a in attempts if a["status"] != "skipped"}
@@ -97,10 +162,12 @@ class ChatEngine:
             response = new_response
             attempts = attempts + new_attempts
             retries += 1
-            assessment = assess_quality(response, request, min_score=min_score)
+            assessment = await self._assess_response(response, request)
 
         response.xrouter = response.xrouter or {}
         response.xrouter["quality"] = {"score": assessment.score, "passed": assessment.passed, "reasons": assessment.reasons}
+        if assessment.llm_feedback:
+            response.xrouter["quality"]["llm_feedback"] = assessment.llm_feedback
         if retries:
             response.xrouter["quality_retries"] = retries
         return response, attempts
