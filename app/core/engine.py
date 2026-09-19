@@ -13,7 +13,7 @@ from app.contracts.response import ChatCompletionChunk, ChatCompletionResponse
 from app.contracts.router import RoutingDecision
 from app.core.context import AppContext
 from app.core.errors import NoAvailableModelError
-from app.execution.race import run_race
+from app.execution.race import run_race, run_stream_race
 from app.intelligence.quality_gate import assess as assess_quality
 from app.intelligence.task_classifier import TaskClassification, classify
 from app.observability.logging import get_logger
@@ -56,9 +56,15 @@ class ChatEngine:
 
     def _use_race(self, request: ChatCompletionRequest) -> bool:
         """Race mode (section 三十六) needs both the server-wide switch on
-        and an explicit per-request opt-in, and only ever applies to
-        non-streaming requests — see app/execution/race.py for why."""
+        and an explicit per-request opt-in, and only applies to
+        non-streaming requests — streaming requests are raced by
+        _use_stream_race/run_stream_race instead (app/execution/race.py)."""
         return bool(self.ctx.settings.routing.race_mode_enabled and request.race and not request.stream)
+
+    def _use_stream_race(self, request: ChatCompletionRequest) -> bool:
+        """Streaming counterpart to _use_race: same server-wide switch and
+        per-request opt-in, but for request.stream=True instead."""
+        return bool(self.ctx.settings.routing.race_mode_enabled and request.race and request.stream)
 
     async def _apply_quality_gate(
         self, decision: RoutingDecision, request: ChatCompletionRequest,
@@ -246,11 +252,20 @@ class ChatEngine:
             attempts_seen.append(attempt)
 
         try:
-            async for chunk in run_stream_chat(
-                decision, self.ctx.providers, self.ctx.circuits, self.ctx.quota, self.ctx.limiter,
-                request, self.ctx.settings.routing.max_fallback_attempts, on_attempt=_on_attempt,
-                performance=self.ctx.performance,
-            ):
+            if self._use_stream_race(request):
+                stream = run_stream_race(
+                    decision, self.ctx.providers, self.ctx.circuits, self.ctx.quota, self.ctx.limiter,
+                    request, self.ctx.settings.routing.max_fallback_attempts,
+                    self.ctx.settings.routing.race_candidate_count,
+                    on_attempt=_on_attempt, events=self.ctx.events, performance=self.ctx.performance,
+                )
+            else:
+                stream = run_stream_chat(
+                    decision, self.ctx.providers, self.ctx.circuits, self.ctx.quota, self.ctx.limiter,
+                    request, self.ctx.settings.routing.max_fallback_attempts, on_attempt=_on_attempt,
+                    performance=self.ctx.performance,
+                )
+            async for chunk in stream:
                 if first_token_at is None:
                     first_token_at = time.time()
                 total_chunks += 1

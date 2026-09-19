@@ -171,15 +171,27 @@ candidates (default 2) concurrently, returns whichever answers first, and
 cancels whatever's still in flight — the response's `xrouter` metadata
 carries `"race": true` and `"race_candidates": N` so you can see it
 happened. If every raced candidate fails, XRouter falls back to the
-remaining candidates one at a time, same as the non-race path. Race mode
-only applies to non-streaming requests in this phase — `stream: true`
-silently ignores the `race` flag (see `app/execution/race.py` for why).
+remaining candidates one at a time, same as the non-race path.
+
+Streaming requests (`"stream": true`) are raced too, the same opt-in way —
+`app/execution/race.py`'s `run_stream_race` races on *first-chunk
+arrival* instead of a full response (`app/routing/fallback.py`'s
+`try_candidate_stream`/`run_stream_chat` already commit to a candidate at
+that same boundary for the non-race streaming path), then streams the
+winner's remaining chunks through as they arrive. One thing streaming
+racing has to do that non-streaming racing never needed to: a losing
+candidate that already received its first chunk is holding an open
+provider-side stream nothing will ever read further — `run_stream_race`
+explicitly closes (`aclose()`s) every such generator so it can't leak a
+connection, both for candidates it cancels outright and for the rarer case
+where two candidates' first chunks land in the same instant and only one
+can win.
 
 ### Quality gate
 
-Also off by default (`routing.quality_gate_enabled: false`) — a failed
-gate costs an extra provider call, so it doesn't turn on silently either.
-When enabled, every non-streaming response is scored by
+Off by default (`routing.quality_gate_enabled: false`) — a failed gate
+costs an extra provider call, so it doesn't turn on silently either.
+When enabled, every **non-streaming** response is scored by
 `app/intelligence/quality_gate.py`: an empty reply, output the provider
 itself cut short (`finish_reason: "length"`), a small local model stuck
 repeating one word or character, or (when the request forced a specific
@@ -200,6 +212,23 @@ what happened:
   "quality_retries": 1
 }
 ```
+
+**Streaming requests never run the quality gate**, and this is a
+deliberate, permanent scope decision rather than a gap waiting to be
+filled — see `app/intelligence/quality_gate.py`'s module docstring for the
+full reasoning. In short: a streamed response is already being sent to
+the client chunk by chunk as it's produced, so by the time enough of it
+exists to assess, there's nothing left to retry — the client has already
+seen it. The alternatives all have real costs that weren't worth taking on
+for this phase: gating on the first chunk alone can only ever check 1 of
+the gate's 5 real signals (a forced tool call missing from that chunk) and
+would be a misleadingly thin "quality gate"; buffering the whole response
+server-side before forwarding anything would give the full 5-signal gate
+but defeats the entire point of streaming (the client would wait for the
+complete response either way, just receive it pre-chunked afterward).
+Streaming race mode (above) was extended because it only ever needed a
+first-chunk-arrival signal to begin with — the quality gate's signals
+mostly aren't available that early.
 
 ### DAG Executor
 
@@ -1154,7 +1183,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-421 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+434 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -1168,7 +1197,12 @@ controller (neutral below `MIN_SAMPLES`, EMA latency/success weighting,
 graceful start/stop of its background snapshot loop), race mode
 (fastest-candidate-wins, loser cancellation, all-raced-failed fallback,
 `race.started`/`race.completed` events, candidate-count clamping, and the
-server-switch/per-request-opt-in/no-streaming gating logic), the
+server-switch/per-request-opt-in gating logic for both the non-streaming
+and streaming gates — plus, for streaming racing specifically, first-chunk
+arrival deciding the winner, a losing generator that already got its first
+chunk being closed rather than leaked, and skipped candidates being logged
+by `run_stream_race` even though `run_stream_chat` deliberately still
+doesn't log them), the
 quality gate (empty/truncated/degenerate-repetition/missing-forced-
 tool-call detection, retry-to-next-untried-candidate, best-effort return
 when every candidate still fails, `quality.failed` events, and the
@@ -1440,7 +1474,7 @@ reachable" tests now explicitly disable every provider rather than relying
 on the host having none installed, and the cache fixture uses
 `asyncio.run()` instead of the now-removed implicit-event-loop fallback).
 
-## What's implemented (Phase 1 + Phase 2 + Phase 3 + Phase 4 + partial Phase 5)
+## What's implemented (Phase 1 + Phase 2 + Phase 3 + Phase 4 + Phase 5)
 
 **Phase 1:** FastAPI gateway · OpenAI-compatible `/v1/models` +
 `/v1/chat/completions` (incl. `stream=true`) · Provider adapter interface +
@@ -1470,12 +1504,14 @@ scorer, with a background loop persisting snapshots to `routing_metrics`
 and emitting `routing.changed` events on significant weight shifts;
 visible live via `/admin/metrics`. Race Mode (`app/execution/race.py`) —
 opt-in (`routing.race_mode_enabled` + per-request `"race": true`)
-concurrent dispatch of the top `race_candidate_count` ranked candidates
-for non-streaming chat completions, returning whichever answers first and
-cancelling the rest; reuses the exact same breaker/quota/retry/performance
-bookkeeping as the sequential fallback chain via a shared
-`try_candidate()` helper, and falls back to the remaining candidates
-sequentially if every raced one fails. Quality Gate
+concurrent dispatch of the top `race_candidate_count` ranked candidates,
+returning whichever answers first and cancelling the rest; reuses the
+exact same breaker/quota/retry/performance bookkeeping as the sequential
+fallback chain via a shared `try_candidate()` helper, and falls back to
+the remaining candidates sequentially if every raced one fails. Covers
+both non-streaming (`run_race`) and streaming (`run_stream_race`, which
+races on first-chunk arrival via a shared `try_candidate_stream()` helper
+and explicitly closes any losing candidate's already-open stream). Quality Gate
 (`app/intelligence/quality_gate.py`) — opt-in (`routing.quality_gate_enabled`)
 deterministic scoring of a non-streaming response (empty, truncated,
 degenerate word/character repetition, missing forced tool call) that
@@ -1704,11 +1740,14 @@ tool-using agents that act on a plan's own intermediate results mid-run
 rather than a single forced-JSON planning call up front, a real
 embeddings-backed `Retriever` (Memory/RAG is keyword-based today, by
 design — see above), plugin loader, browser/web-AI adapter, network
-failover/VPN layer, PostgreSQL migration, LLM-graded (as opposed to
-structural) quality assessment, and streaming versions of race mode and
-the quality gate (both above only cover non-streaming requests — a
-streamed response has already reached the client chunk by chunk by the
-time either could act on it). Their directories exist as reserved, empty
+failover/VPN layer, PostgreSQL migration, and LLM-graded (as opposed to
+structural) quality assessment. Race mode now covers streaming too (see
+above); the quality gate remains **deliberately** non-streaming-only —
+not a gap, a permanent scope decision (a streamed response has already
+reached the client chunk by chunk by the time it could be assessed, so
+there's nothing left to retry; see `app/intelligence/quality_gate.py`'s
+docstring and the Quality gate section above for the full reasoning and
+the alternatives considered). Their directories exist as reserved, empty
 packages (`app/execution/cancellation.py`, `app/network`, `app/plugins`)
 so the rest of Phase 5+ has a home without restructuring what's already
 built.

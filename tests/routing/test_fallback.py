@@ -7,7 +7,7 @@ from app.core.errors import NoAvailableModelError
 from app.core.registry import ProviderRegistry
 from app.quota.tracker import QuotaTracker
 from app.reliability.circuit_breaker import CircuitBreakerRegistry, CircuitState
-from app.routing.fallback import run_chat, run_stream_chat
+from app.routing.fallback import run_chat, run_stream_chat, try_candidate_stream
 from app.routing.scheduler import ConcurrencyLimiter
 from tests.helpers import FakeProvider, make_model
 
@@ -117,3 +117,46 @@ async def test_streaming_mid_stream_failure_yields_error_marker_not_silent_fallb
     chunks = [c async for c in run_stream_chat(_decision(["p1"]), providers, circuits, quota, limiter, _req(True), max_attempts=3)]
     assert chunks[-1].choices[0].finish_reason == "error"
     assert "interrupted" in chunks[-1].choices[0].delta["content"]
+
+
+@pytest.mark.asyncio
+async def test_try_candidate_stream_skip_returns_a_real_attempt_dict():
+    # try_candidate_stream itself (used by run_stream_race, which DOES want
+    # to log skips) always reports a real "skipped" attempt -- unlike
+    # run_stream_chat below, which deliberately discards it.
+    providers, circuits, quota, limiter = _setup({"p1": "server_error"})
+    for _ in range(3):  # trip p1's breaker (default threshold=3)
+        try:
+            await run_chat(_decision(["p1"]), providers, circuits, quota, limiter, _req(), max_attempts=1)
+        except NoAvailableModelError:
+            pass
+    gen, first_chunk, attempt = await try_candidate_stream(0, _decision(["p1"]).primary, providers, circuits, quota, limiter, _req(True))
+    assert gen is None
+    assert first_chunk is None
+    assert attempt == {"provider_id": "p1", "model_id": "test-model", "status": "skipped"}
+
+
+@pytest.mark.asyncio
+async def test_streaming_extraction_still_swallows_skipped_candidates():
+    # Regression test for the try_candidate_stream extraction: run_stream_chat
+    # must keep its pre-existing behavior of never logging a skipped
+    # candidate into attempts_log, even though try_candidate_stream (the
+    # shared helper it now calls) returns a real "skipped" attempt dict.
+    providers, circuits, quota, limiter = _setup({"p1": "server_error", "p2": "success"})
+    for _ in range(3):  # trip p1's breaker
+        try:
+            await run_chat(_decision(["p1"]), providers, circuits, quota, limiter, _req(), max_attempts=1)
+        except NoAvailableModelError:
+            pass
+
+    attempts_seen: list[dict] = []
+    chunks = [
+        c async for c in run_stream_chat(
+            _decision(["p1", "p2"]), providers, circuits, quota, limiter, _req(True), max_attempts=3,
+            on_attempt=attempts_seen.append,
+        )
+    ]
+    assert len(chunks) == 3
+    assert chunks[0].model == "p2/test-model"
+    assert all(a["status"] != "skipped" for a in attempts_seen)
+    assert [a["provider_id"] for a in attempts_seen] == ["p2"]

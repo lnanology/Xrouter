@@ -32,9 +32,9 @@ class ChatCompletionRequest(BaseModel):
     routing_policy: str | None = None
     x_cache: bool | None = None
     # Phase 2 race mode (section 三十六): race the top-N ranked candidates
-    # concurrently and return whichever answers first. Only takes effect
-    # when the server-wide routing.race_mode_enabled switch is also on, and
-    # only for non-streaming requests (stream=true ignores this flag).
+    # concurrently and return whichever answers first (or, for a streaming
+    # request, whichever's first chunk arrives first). Only takes effect
+    # when the server-wide routing.race_mode_enabled switch is also on.
     race: bool = False
 
 

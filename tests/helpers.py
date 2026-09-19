@@ -43,6 +43,13 @@ class FakeProvider(Provider):
         self.responses = responses
         self.call_count = 0
         self.cancelled = False
+        # Set when stream_chat()'s generator is closed early via aclose()
+        # while suspended mid-stream (e.g. a losing race candidate that
+        # already emitted its first chunk) -- distinguishes an early abort
+        # from simply running to completion, which streaming race mode
+        # must always do for every non-winning generator to avoid leaking
+        # an open provider-side stream.
+        self.stream_aborted = False
         self.last_request: ChatCompletionRequest | None = None
         # Every request this provider ever received, in order -- lets a
         # test inspect an *intermediate* call (e.g. the second of several
@@ -107,16 +114,26 @@ class FakeProvider(Provider):
         )
 
     async def stream_chat(self, model: str, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
+        if self.delay_seconds:
+            try:
+                await asyncio.sleep(self.delay_seconds)
+            except asyncio.CancelledError:
+                self.cancelled = True
+                raise
         self._maybe_raise()
         n_chunks = 3
-        for i in range(n_chunks):
-            if self.fail_after_chunks is not None and i >= self.fail_after_chunks:
-                raise ProviderError("simulated mid-stream failure", provider_id=self.id)
-            yield ChatCompletionChunk(
-                id="chatcmpl-test",
-                model=f"{self.id}/{model}",
-                choices=[ChatCompletionChunkChoice(index=0, delta={"content": f"chunk{i}"}, finish_reason=None)],
-            )
+        try:
+            for i in range(n_chunks):
+                if self.fail_after_chunks is not None and i >= self.fail_after_chunks:
+                    raise ProviderError("simulated mid-stream failure", provider_id=self.id)
+                yield ChatCompletionChunk(
+                    id="chatcmpl-test",
+                    model=f"{self.id}/{model}",
+                    choices=[ChatCompletionChunkChoice(index=0, delta={"content": f"chunk{i}"}, finish_reason=None)],
+                )
+        except GeneratorExit:
+            self.stream_aborted = True
+            raise
 
 
 class FakeTool:

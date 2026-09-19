@@ -116,6 +116,88 @@ async def run_chat(
     raise NoAvailableModelError("All candidates in the fallback chain failed.", attempts=attempts_log)
 
 
+async def try_candidate_stream(
+    idx: int,
+    candidate: RoutingCandidate,
+    providers: ProviderRegistry,
+    circuits: CircuitBreakerRegistry,
+    quota: QuotaTracker,
+    limiter: ConcurrencyLimiter,
+    request: ChatCompletionRequest,
+    performance: PerformanceController | None = None,
+) -> tuple[AsyncIterator[ChatCompletionChunk] | None, ChatCompletionChunk | None, dict]:
+    """Streaming counterpart to try_candidate (above): runs one candidate's
+    admission -> bounded-timeout wait for its FIRST chunk only, then hands
+    the still-open generator back to the caller rather than draining it
+    itself — the same "commit on first chunk" boundary run_stream_chat has
+    always used, just factored out so both the sequential fallback
+    (run_stream_chat, below) and streaming race mode
+    (app/execution/race.py's run_stream_race) can share it, mirroring how
+    try_candidate is already shared between run_chat and run_race.
+
+    Returns (generator, first_chunk, attempt) on success — the caller owns
+    draining (and, if it ends up not being used, aclose()-ing) the
+    generator from here on. Returns (None, None, attempt) on skip/failure.
+    Never raises."""
+    provider = providers.get(candidate.provider_id)
+    breaker = circuits.get(candidate.provider_id)
+    if provider is None or not breaker.allow_request():
+        return None, None, {"provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "skipped"}
+
+    start = time.time()
+    quota.record_request(candidate.provider_id)
+    gen = provider.stream_chat(candidate.model_id, request)
+    try:
+        async def _first():
+            return await gen.__anext__()
+
+        first_chunk = await execute_attempt(candidate.provider_id, limiter, provider.config.timeout_seconds, _first)
+    except StopAsyncIteration:
+        first_chunk = None
+    except ProviderError as e:
+        breaker.record_failure()
+        if isinstance(e, ProviderRateLimitError):
+            quota.record_rate_limit(candidate.provider_id, e.retry_after)
+        if performance is not None:
+            performance.record(candidate.provider_id, (time.time() - start) * 1000, success=False)
+        return None, None, {
+            "provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "failed", "error": str(e),
+        }
+
+    # First chunk arrived (or the stream ended immediately, empty): commit.
+    breaker.record_success()
+    quota.record_success(candidate.provider_id)
+    latency_ms = (time.time() - start) * 1000
+    if performance is not None:
+        performance.record(candidate.provider_id, latency_ms, success=True)
+    attempt = {
+        "provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "success", "latency_ms": latency_ms,
+    }
+    return gen, first_chunk, attempt
+
+
+async def drain_stream(
+    candidate: RoutingCandidate, gen: AsyncIterator[ChatCompletionChunk], first_chunk: ChatCompletionChunk | None,
+) -> AsyncIterator[ChatCompletionChunk]:
+    """Shared tail end of streaming a committed candidate: yield the first
+    chunk (already consumed by try_candidate_stream) then the rest of the
+    generator, turning a mid-stream ProviderError into a terminal in-band
+    error chunk instead of a raised exception (the client already saw
+    partial output from this specific model, so failing over silently is
+    not possible anymore)."""
+    if first_chunk is not None:
+        yield first_chunk
+    try:
+        async for chunk in gen:
+            yield chunk
+    except ProviderError as e:
+        yield ChatCompletionChunk(
+            id="chatcmpl-error",
+            model=f"{candidate.provider_id}/{candidate.model_id}",
+            choices=[{"index": 0, "delta": {"content": f"\n[xrouter: stream interrupted: {e}]"}, "finish_reason": "error"}],
+        )
+
+
 async def run_stream_chat(
     decision: RoutingDecision,
     providers: ProviderRegistry,
@@ -136,61 +218,25 @@ async def run_stream_chat(
     last_error: Exception | None = None
 
     for idx, candidate in enumerate(_candidates(decision)[:max_attempts]):
-        provider = providers.get(candidate.provider_id)
-        breaker = circuits.get(candidate.provider_id)
-        if provider is None or not breaker.allow_request():
+        gen, first_chunk, attempt = await try_candidate_stream(
+            idx, candidate, providers, circuits, quota, limiter, request, performance,
+        )
+        if attempt["status"] == "skipped":
+            # Preserves this function's existing behavior exactly: a
+            # breaker-blocked/missing-provider candidate was never logged
+            # here (unlike run_chat/run_race, which do log skips) — the
+            # `continue` used to happen before any attempt dict existed at
+            # all, so it still isn't recorded now that one does.
             continue
-
-        start = time.time()
-        quota.record_request(candidate.provider_id)
-        gen = provider.stream_chat(candidate.model_id, request)
-        first_chunk: ChatCompletionChunk | None = None
-        try:
-            async def _first():
-                return await gen.__anext__()
-
-            first_chunk = await execute_attempt(candidate.provider_id, limiter, provider.config.timeout_seconds, _first)
-        except StopAsyncIteration:
-            first_chunk = None
-        except ProviderError as e:
-            breaker.record_failure()
-            if isinstance(e, ProviderRateLimitError):
-                quota.record_rate_limit(candidate.provider_id, e.retry_after)
-            if performance is not None:
-                performance.record(candidate.provider_id, (time.time() - start) * 1000, success=False)
-            last_error = e
-            attempt = {"provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "failed", "error": str(e)}
-            attempts_log.append(attempt)
-            if on_attempt:
-                on_attempt(attempt)
-            continue
-
-        # First chunk arrived: commit to this provider for the rest of the stream.
-        breaker.record_success()
-        quota.record_success(candidate.provider_id)
-        first_chunk_latency_ms = (time.time() - start) * 1000
-        if performance is not None:
-            performance.record(candidate.provider_id, first_chunk_latency_ms, success=True)
-        attempt = {
-            "provider_id": candidate.provider_id, "model_id": candidate.model_id, "status": "success",
-            "latency_ms": first_chunk_latency_ms,
-        }
         attempts_log.append(attempt)
         if on_attempt:
             on_attempt(attempt)
+        if gen is None:
+            last_error = RuntimeError(attempt.get("error", "stream failed to start"))
+            continue
 
-        if first_chunk is not None:
-            yield first_chunk
-        try:
-            async for chunk in gen:
-                yield chunk
-        except ProviderError as e:
-            # Mid-stream failure: cannot fail over anymore, surface as final chunk.
-            yield ChatCompletionChunk(
-                id="chatcmpl-error",
-                model=f"{candidate.provider_id}/{candidate.model_id}",
-                choices=[{"index": 0, "delta": {"content": f"\n[xrouter: stream interrupted: {e}]"}, "finish_reason": "error"}],
-            )
+        async for chunk in drain_stream(candidate, gen, first_chunk):
+            yield chunk
         return
 
     raise NoAvailableModelError(
