@@ -10,7 +10,7 @@ from app.contracts.model import ModelInfo
 from app.contracts.provider import ProviderCapability, ProviderConfig, ProviderHealth, ProviderStatus
 from app.contracts.request import ChatCompletionRequest
 from app.contracts.response import ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionResponse, Usage
-from app.core.errors import ProviderError
+from app.core.errors import ProviderCapabilityUnsupportedError, ProviderError
 from app.providers.base import Provider
 
 
@@ -24,7 +24,7 @@ class FakeProvider(Provider):
         self, config: ProviderConfig, models: list[ModelInfo], behavior="success",
         fail_after_chunks: int | None = None, delay_seconds: float = 0.0,
         content: str = "ok", finish_reason: str = "stop", tool_calls: list[dict] | None = None,
-        responses: list[dict] | None = None,
+        responses: list[dict] | None = None, embed_vectors: dict[str, list[float]] | None = None,
     ):
         super().__init__(config)
         self._models = models
@@ -34,6 +34,13 @@ class FakeProvider(Provider):
         self.content = content
         self.finish_reason = finish_reason
         self.tool_calls = tool_calls
+        # Scripted embed() responses, keyed by input text -- lets a test
+        # give this fake EMBEDDINGS capability without needing a second
+        # test-double class. None (the default) means embed() behaves
+        # like every other adapter that never declared the capability:
+        # raises ProviderCapabilityUnsupportedError, same as the real
+        # Provider base class default.
+        self.embed_vectors = embed_vectors
         # Optional script: one dict of {content?, finish_reason?, tool_calls?}
         # per call, consumed in order (the last entry repeats once
         # exhausted). Lets a single FakeProvider stand in for a real model
@@ -58,7 +65,10 @@ class FakeProvider(Provider):
         self.request_log: list[ChatCompletionRequest] = []
 
     def capabilities(self) -> set[ProviderCapability]:
-        return {ProviderCapability.CHAT, ProviderCapability.STREAMING}
+        caps = {ProviderCapability.CHAT, ProviderCapability.STREAMING}
+        if self.embed_vectors is not None:
+            caps.add(ProviderCapability.EMBEDDINGS)
+        return caps
 
     async def list_models(self) -> list[ModelInfo]:
         return self._models
@@ -135,6 +145,12 @@ class FakeProvider(Provider):
             self.stream_aborted = True
             raise
 
+    async def embed(self, model: str, texts: list[str]) -> list[list[float]]:
+        if self.embed_vectors is None:
+            raise ProviderCapabilityUnsupportedError(f"Provider '{self.id}' does not support embeddings", provider_id=self.id)
+        self._maybe_raise()
+        return [self.embed_vectors.get(t, [0.0]) for t in texts]
+
 
 class FakeTool:
     """Scriptable ExecutableTool test double (app/tools/base.py's
@@ -189,6 +205,7 @@ class FakeTool:
 async def build_test_engine(
     tmp_path, provider_specs: dict[str, dict], tool_specs: dict[str, dict] | None = None,
     ab_routing_overrides: dict | None = None, policy_learning_overrides: dict | None = None,
+    retrieval_overrides: dict | None = None,
     **routing_overrides,
 ):
     """Assembles a real ChatEngine wired to FakeProviders instead of real
@@ -212,11 +229,15 @@ async def build_test_engine(
     unless a test opts in with e.g. {"enabled": True, "variants": [...]}.
     policy_learning_overrides: passed straight through to
     PolicyLearningConfig; defaults to a disabled PolicyLearner (matching
-    production's own default) unless a test opts in."""
+    production's own default) unless a test opts in.
+    retrieval_overrides: passed straight through to RetrievalConfig;
+    defaults to disabled (matching production's own default, and every
+    existing test's expectations) unless a test opts in with e.g.
+    {"enabled": True, "embedding_provider": "..."}."""
     from app.cache.manager import CacheManager
     from app.core.config import (
-        ABRoutingConfig, BenchmarkConfig, CacheConfig, EvolutionConfig, PolicyLearningConfig, RoutingConfig,
-        SelfHealingConfig, ServerConfig, Settings,
+        ABRoutingConfig, BenchmarkConfig, CacheConfig, EvolutionConfig, PolicyLearningConfig, RetrievalConfig,
+        RoutingConfig, SelfHealingConfig, ServerConfig, Settings,
     )
     from app.core.context import AppContext
     from app.core.engine import ChatEngine
@@ -266,10 +287,11 @@ async def build_test_engine(
     routing = RoutingConfig(**routing_defaults)
     ab_routing = ABRoutingConfig(**(ab_routing_overrides or {}))
     policy_learning = PolicyLearningConfig(**(policy_learning_overrides or {}))
+    retrieval = RetrievalConfig(**(retrieval_overrides or {}))
     settings = Settings(
         server=ServerConfig(), routing=routing, cache=CacheConfig(enabled=False), benchmark=BenchmarkConfig(),
         ab_routing=ab_routing, policy_learning=policy_learning, evolution=EvolutionConfig(),
-        self_healing=SelfHealingConfig(), providers={}, raw_routing={},
+        self_healing=SelfHealingConfig(), retrieval=retrieval, providers={}, raw_routing={},
     )
 
     metrics_repo = MetricsRepository(db)

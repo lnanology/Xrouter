@@ -44,7 +44,7 @@ class OpenAICompatibleAdapter(Provider):
         )
 
     def capabilities(self) -> set[ProviderCapability]:
-        return {ProviderCapability.CHAT, ProviderCapability.STREAMING, ProviderCapability.TOOLS}
+        return {ProviderCapability.CHAT, ProviderCapability.STREAMING, ProviderCapability.TOOLS, ProviderCapability.EMBEDDINGS}
 
     def _require_configured(self) -> None:
         if not self._configured:
@@ -201,6 +201,29 @@ class OpenAICompatibleAdapter(Provider):
         except httpx.ConnectError as e:
             self._usage.requests_failed += 1
             raise ProviderConnectionError(str(e), provider_id=self.id) from e
+
+    async def embed(self, model: str, texts: list[str]) -> list[list[float]]:
+        self._require_configured()
+        self._usage.requests_total += 1
+        body = {"model": model, "input": texts}
+        try:
+            resp = await self._client.post("/embeddings", json=body)
+        except httpx.TimeoutException as e:
+            self._usage.requests_failed += 1
+            raise ProviderTimeoutError(str(e), provider_id=self.id) from e
+        except httpx.ConnectError as e:
+            self._usage.requests_failed += 1
+            raise ProviderConnectionError(str(e), provider_id=self.id) from e
+
+        try:
+            self._raise_for_status(resp)
+        except ProviderError:
+            self._usage.requests_failed += 1
+            raise
+
+        data = resp.json()
+        rows = sorted(data.get("data", []), key=lambda r: r.get("index", 0))
+        return [r.get("embedding", []) for r in rows]
 
     async def close(self) -> None:
         await self._client.aclose()

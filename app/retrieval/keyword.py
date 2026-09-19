@@ -1,17 +1,17 @@
-"""The one real Retriever (app/retrieval/base.py) XRouter ships today:
+"""The always-on, zero-extra-cost Retriever (app/retrieval/base.py):
 keyword/substring search over app/storage/repositories/memory.py's
 memory_entries, ordered by recency among matches. Deliberately not
-"semantic" retrieval -- XRouter has no embedding provider adapter and no
-vector store (see the Plugin System spec's own "embeddings" entry, which
-is still just a reserved future plugin slot), and faking similarity
-search with e.g. naive cosine-on-word-overlap and calling it RAG would be
-exactly the "fake placeholder functionality" XRouter's own development
-rules forbid. Keyword search is not a compromise dressed up as something
-fancier -- it is a real, working retrieval step (retrieve -> augment the
-next call's context -> generate), which is what actually makes this RAG
-rather than nothing. Swapping in a genuine embedding-based Retriever
-later, once one exists, needs no change here beyond adding that second
-implementation of the same Protocol."""
+"semantic" retrieval on its own -- and faking similarity search with e.g.
+naive cosine-on-word-overlap and calling it RAG would be exactly the
+"fake placeholder functionality" XRouter's own development rules forbid.
+Keyword search is not a compromise dressed up as something fancier -- it
+is a real, working retrieval step (retrieve -> augment the next call's
+context -> generate), which is what actually makes this RAG rather than
+nothing, and it stays the default because it costs nothing extra. A
+genuine embedding-based Retriever now also exists
+(app/retrieval/embedding.py's EmbeddingRetriever, real vector similarity
+via a provider's embed() call) as an opt-in upgrade -- see its own
+docstring and RetrievalConfig in app/core/config.py."""
 from __future__ import annotations
 
 from app.retrieval.base import RetrievedChunk

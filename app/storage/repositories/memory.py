@@ -1,9 +1,12 @@
-"""Backs memory_entries (Phase 3: Memory/RAG groundwork). Keyword/recency
-retrieval only -- there is no embedding provider or vector store in
-XRouter yet (see app/retrieval/'s module docstring for why that's an
-honest scoping choice, not an oversight), so `search()` is a real,
-working substring match over stored content, not a fake stand-in for
-semantic similarity dressed up as one."""
+"""Backs memory_entries (Phase 3: Memory/RAG groundwork). `search()` is a
+real, working substring match over stored content -- app/retrieval/
+keyword.py's KeywordRetriever, always available, never a fake stand-in for
+semantic similarity dressed up as one. `save()` can also optionally carry
+a real embedding vector (`embedding_json`, nullable -- most rows have
+none) when app/retrieval/embedding.py's opt-in EmbeddingRetriever path is
+enabled; `embedded()` is that retriever's own candidate-pool query. See
+app/retrieval/'s module docstring for the two Retriever implementations
+this repository backs."""
 from __future__ import annotations
 
 import json
@@ -32,13 +35,20 @@ class MemoryRepository:
     def __init__(self, db: Database):
         self._db = db
 
-    async def save(self, scope: str, content: str, tags: list[str] | None = None) -> MemoryEntry:
-        entry = MemoryEntry(id=new_id("mem"), scope=scope, content=content, tags=tags or [], created_at=time.time())
+    async def save(
+        self, scope: str, content: str, tags: list[str] | None = None, embedding: list[float] | None = None,
+    ) -> MemoryEntry:
+        entry = MemoryEntry(
+            id=new_id("mem"), scope=scope, content=content, tags=tags or [], created_at=time.time(), embedding=embedding,
+        )
         try:
             async with self._db.connect() as conn:
                 await conn.execute(
-                    "INSERT INTO memory_entries (id, scope, content, tags_json, created_at) VALUES (?,?,?,?,?)",
-                    (entry.id, entry.scope, entry.content, json.dumps(entry.tags), entry.created_at),
+                    "INSERT INTO memory_entries (id, scope, content, tags_json, created_at, embedding_json) VALUES (?,?,?,?,?,?)",
+                    (
+                        entry.id, entry.scope, entry.content, json.dumps(entry.tags), entry.created_at,
+                        json.dumps(entry.embedding) if entry.embedding is not None else None,
+                    ),
                 )
                 await conn.commit()
         except Exception as e:
@@ -57,7 +67,7 @@ class MemoryRepository:
         try:
             async with self._db.connect() as conn:
                 cursor = await conn.execute(
-                    "SELECT id, scope, content, tags_json, created_at FROM memory_entries"
+                    "SELECT id, scope, content, tags_json, created_at, embedding_json FROM memory_entries"
                     " WHERE scope = ? ORDER BY created_at DESC LIMIT 200",
                     (scope,),
                 )
@@ -77,7 +87,7 @@ class MemoryRepository:
         try:
             async with self._db.connect() as conn:
                 cursor = await conn.execute(
-                    "SELECT id, scope, content, tags_json, created_at FROM memory_entries"
+                    "SELECT id, scope, content, tags_json, created_at, embedding_json FROM memory_entries"
                     " WHERE scope = ? ORDER BY created_at DESC LIMIT ?",
                     (scope, limit),
                 )
@@ -87,6 +97,27 @@ class MemoryRepository:
             logger.warning("memory recent query failed: %s", e)
             return []
 
+    async def embedded(self, scope: str, limit: int = 200) -> list[MemoryEntry]:
+        """The candidate pool app/retrieval/embedding.py's EmbeddingRetriever
+        scans for a query -- every entry in `scope` that actually has an
+        embedding, newest first, capped the same way search()'s own scan
+        is capped. Entries saved before retrieval was enabled (or whose
+        embed() call itself failed open) simply have no embedding and are
+        invisible here -- not an error, just nothing to rank them by."""
+        try:
+            async with self._db.connect() as conn:
+                cursor = await conn.execute(
+                    "SELECT id, scope, content, tags_json, created_at, embedding_json FROM memory_entries"
+                    " WHERE scope = ? AND embedding_json IS NOT NULL ORDER BY created_at DESC LIMIT ?",
+                    (scope, limit),
+                )
+                rows = await cursor.fetchall()
+                return [_row_to_entry(r) for r in rows]
+        except Exception as e:
+            logger.warning("memory embedded query failed: %s", e)
+            return []
+
 
 def _row_to_entry(r) -> MemoryEntry:
-    return MemoryEntry(id=r[0], scope=r[1], content=r[2], tags=json.loads(r[3]), created_at=r[4])
+    embedding = json.loads(r[5]) if len(r) > 5 and r[5] is not None else None
+    return MemoryEntry(id=r[0], scope=r[1], content=r[2], tags=json.loads(r[3]), created_at=r[4], embedding=embedding)

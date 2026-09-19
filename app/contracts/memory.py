@@ -19,3 +19,9 @@ class MemoryEntry(BaseModel):
     content: str
     tags: list[str] = Field(default_factory=list)
     created_at: float
+    # Set only when Retrieval Config's embedding-backed path is enabled
+    # and app/retrieval/embedding.py successfully embedded this entry at
+    # save time -- None for every entry saved with retrieval off (the
+    # default), and for one whose embed() call failed open. See
+    # app/retrieval/embedding.py's EmbeddingRetriever, the only reader.
+    embedding: list[float] | None = None

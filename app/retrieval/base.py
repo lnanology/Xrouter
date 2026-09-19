@@ -1,12 +1,17 @@
 """Retrieval interface (Phase 3: RAG groundwork). Swappable like every
-other capability in XRouter (Provider, ExecutableTool): app/retrieval/
-keyword.py is the one real implementation today, backed by
-app/storage/repositories/memory.py's substring search. A future
-embedding-backed implementation (real vector similarity, once XRouter
-has an embedding provider and a vector store -- neither exists yet) can
-implement this same Protocol and slot in without touching a single
-caller. See app/retrieval/keyword.py's own docstring for why keyword
-retrieval, not a faked-up "semantic" search, is what ships first."""
+other capability in XRouter (Provider, ExecutableTool): two real
+implementations exist against this same Protocol --
+app/retrieval/keyword.py's KeywordRetriever (substring search over
+app/storage/repositories/memory.py, always available, zero extra cost)
+and app/retrieval/embedding.py's EmbeddingRetriever (real embedding +
+cosine-similarity search, opt-in via RetrievalConfig.enabled since it
+spends a real provider call per recall/remember). app/agents/
+orchestrator.py's `_build_retriever()` picks between them from config;
+neither caller needed to change when the second implementation was
+added. See app/retrieval/keyword.py's and app/retrieval/embedding.py's
+own docstrings for why keyword retrieval ships as the always-on default
+and embedding retrieval as the opt-in upgrade, rather than either one
+faking the other."""
 from __future__ import annotations
 
 from typing import Protocol, runtime_checkable

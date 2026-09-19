@@ -63,10 +63,14 @@ this module leaves alone rather than duplicating.
 Memory (app/storage/repositories/memory.py) is read before, and written
 after, every tier >= 2 run: relevant past entries in the same
 OrchestrationRequest.scope are retrieved and folded into the task's own
-context -- a real, working retrieve-then-augment pipeline (RAG), just
-keyword-based rather than semantic (see app/retrieval/'s own docstring
-for why that's an honest scoping choice). Tier 0-1 stays completely
-untouched by memory too, for the same "don't tax the fast path" reason."""
+context -- a real, working retrieve-then-augment pipeline (RAG).
+_build_retriever() picks which Retriever implementation does that:
+keyword/substring search by default (free, always available), or, when
+RetrievalConfig.enabled, app/retrieval/embedding.py's EmbeddingRetriever
+-- a real embedding + cosine-similarity search, which also makes
+_remember() embed the new summary at save time. See app/retrieval/'s own
+docstring for both implementations. Tier 0-1 stays completely untouched
+by memory too, for the same "don't tax the fast path" reason."""
 from __future__ import annotations
 
 import time
@@ -93,6 +97,8 @@ from app.intelligence.counterfactual import build_counterfactual_analysis
 from app.intelligence.evidence import build_evidence_graph
 from app.intelligence.task_classifier import classify
 from app.observability.logging import get_logger
+from app.retrieval.base import Retriever
+from app.retrieval.embedding import EmbeddingRetriever, embed_for_memory
 from app.retrieval.keyword import KeywordRetriever
 from app.utils.ids import new_id
 
@@ -129,8 +135,23 @@ def _augment_context_for_tier(context: str | None, hint_research: bool) -> str |
     return f"{context}\n\n{note}" if context else note
 
 
+def _build_retriever(engine: "ChatEngine") -> Retriever:
+    """Picks the Retriever implementation from config, once per call --
+    EmbeddingRetriever (real vector similarity, costs a provider call)
+    when RetrievalConfig.enabled, else the always-on, zero-extra-cost
+    KeywordRetriever. See app/retrieval/base.py's module docstring."""
+    retrieval = engine.ctx.settings.retrieval
+    if retrieval.enabled:
+        return EmbeddingRetriever(
+            engine.ctx.memory_repo, engine.ctx.providers,
+            retrieval.embedding_provider, retrieval.embedding_model,
+            max_candidates=retrieval.max_candidates,
+        )
+    return KeywordRetriever(engine.ctx.memory_repo)
+
+
 async def _recall(engine: "ChatEngine", request: OrchestrationRequest) -> str | None:
-    retriever = KeywordRetriever(engine.ctx.memory_repo)
+    retriever = _build_retriever(engine)
     chunks = await retriever.retrieve(request.scope, request.task, top_k=_MEMORY_RECALL_TOP_K)
     if not chunks:
         return request.context
@@ -143,7 +164,13 @@ async def _remember(engine: "ChatEngine", request: OrchestrationRequest, answer:
     if not answer:
         return
     summary = f"Task: {request.task}\nAnswer: {answer}"[:_MEMORY_SUMMARY_MAX_CHARS]
-    await engine.ctx.memory_repo.save(request.scope, summary)
+    retrieval = engine.ctx.settings.retrieval
+    embedding = None
+    if retrieval.enabled:
+        embedding = await embed_for_memory(
+            engine.ctx.providers, retrieval.embedding_provider, retrieval.embedding_model, summary,
+        )
+    await engine.ctx.memory_repo.save(request.scope, summary, embedding=embedding)
 
 
 async def _run_solver(engine: "ChatEngine", request: OrchestrationRequest) -> ChatCompletionResponse:

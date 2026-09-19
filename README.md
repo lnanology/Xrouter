@@ -27,10 +27,11 @@ the-end whole-run check, a Dynamic Agent Team (`POST /v1/agents/run`)
 that assembles whichever of the above pieces a task's own complexity
 actually calls for (solver-only up through planner + specialists +
 critic + research + verifier + synthesizer), a standalone Researcher
-(`POST /v1/research`), and Memory/RAG — a real, keyword-based retrieve →
-augment-context → generate loop backed by a persistent, scope-isolated
-memory store, honestly scoped short of semantic search since XRouter has
-no embedding provider or vector store yet. All five pieces of **Phase 4**
+(`POST /v1/research`), and Memory/RAG — a real retrieve → augment-context
+→ generate loop backed by a persistent, scope-isolated memory store, with
+a swappable `Retriever`: always-on keyword search by default, or a
+genuine opt-in embedding + cosine-similarity `Retriever` once
+`retrieval.enabled` is turned on. All five pieces of **Phase 4**
 are in too: an Evidence Graph that traces a finished answer's own claims
 back to whichever DAG step actually produced each one, a Debate stage —
 automatic at tier 4 — where an Advocate and a Skeptic argue for and
@@ -616,19 +617,59 @@ unrelated callers) so retrieval never wanders outside where it should.
 
 Retrieval itself (`app/retrieval/`) is a swappable `Retriever` Protocol —
 the same "everything replaceable" pattern as `Provider`/`ExecutableTool`
-— with exactly one real implementation today, `KeywordRetriever`: genuine
-substring/word-overlap search over stored memory, not a fixed template.
-This is deliberately **not** semantic search: XRouter has no embedding
-provider adapter and no vector store, and faking similarity with e.g.
-naive cosine-on-word-overlap while calling it "RAG" would be exactly the
-"fake placeholder functionality" the project's own rules forbid. Keyword
-retrieval is a real, working retrieve → augment-context → generate
-pipeline — which is what actually makes this RAG rather than nothing — it
-just isn't semantic yet. A future embeddings-backed `Retriever`, once
-XRouter has an embedding provider and a vector store, slots in behind the
-same Protocol without touching a single caller. Tiers 0-1 never touch
-memory at all, for the same "don't tax the fast path" reason they skip
-every other piece of Phase 3.
+— with **two** real implementations today. `KeywordRetriever` is the
+always-on default: genuine substring/word-overlap search over stored
+memory, zero extra cost, not a fixed template. `EmbeddingRetriever`
+(`app/retrieval/embedding.py`) is a genuine embedding + cosine-similarity
+search, **opt-in** via `retrieval.enabled` in `config/config.yaml`
+(off by default — same "must not turn on silently" reasoning as
+`race_mode_enabled`/`quality_gate_enabled`, since it spends a real
+provider `embed()` call on every recall *and* every remember):
+
+```yaml
+retrieval:
+  enabled: false                        # off by default
+  embedding_provider: ollama            # resolved directly, no router
+  embedding_model: nomic-embed-text     # `ollama pull nomic-embed-text` first
+  max_candidates: 200                   # per-query scan cap, same shape as search()'s own LIMIT
+```
+
+`app/agents/orchestrator.py`'s `_build_retriever()` is the one place that
+picks between them, from config — neither `_recall()` nor `_remember()`
+needed to change shape when the second implementation was added, exactly
+as `app/retrieval/base.py`'s own `Retriever` Protocol was designed to
+allow. When enabled, `_remember()` also embeds the new summary at save
+time (`MemoryRepository.save(..., embedding=...)`, stored as
+`embedding_json`) so it's part of future queries' candidate pool.
+
+Two deliberate design choices worth calling out. First, similarity is
+computed in **pure Python** (`math.sqrt` + a hand-written dot-product
+loop in `_cosine_similarity`), not with numpy: XRouter has no
+numerical-computation dependency today, and per-scope memory volume is
+small enough (`max_candidates`, the same shape as `search()`'s own
+`LIMIT 200` scan cap) that a plain loop is genuinely fast enough —
+adding numpy just to vectorize a loop over a few hundred short vectors
+would itself be the "unnecessary infrastructure" the project's rules
+warn against. Second, `EmbeddingRetriever` **fails open to an empty
+result, never to `KeywordRetriever`**, on any failure — a missing
+provider, an adapter that never declared `ProviderCapability.EMBEDDINGS`
+(`embed()`'s base-class default raises
+`ProviderCapabilityUnsupportedError` rather than inventing a fake
+vector), or a real provider error. That's the same "nothing found" shape
+a genuinely empty scope already produces, which keeps the two
+retrievers' behavior simple to reason about independently rather than
+silently cascading between two different notions of relevance.
+
+`embed()` is implemented today for `OllamaAdapter` (`/api/embed`, the
+only provider enabled by default) and `OpenAICompatibleAdapter`
+(`/embeddings`, the generic adapter behind Groq/OpenRouter/self-hosted
+servers) — both resolved directly by provider id + model name from
+config, not through the router: there's exactly one caller and one fixed
+use, so a router-based "pick a candidate for this capability" path would
+be new routing infrastructure this single call site doesn't need.
+
+Tiers 0-1 never touch memory at all, for the same "don't tax the fast
+path" reason they skip every other piece of Phase 3.
 
 ### Evidence Graph (Phase 4, opt-in: `"trace_evidence": true`)
 
@@ -1228,7 +1269,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-451 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+484 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -1334,13 +1375,21 @@ a node that stays unsatisfied through every retry still reporting overall
 gate on the node itself).
 
 Phase 3 completion coverage: `MemoryRepository`
-(`tests/storage/test_memory_repository.py` — save/recent/scoping, and
+(`tests/storage/test_memory_repository.py` — save/recent/scoping,
 `search()`'s word-overlap matching actually excluding a query's own
 common function words rather than false-positive-matching them as
-substrings of unrelated content), `KeywordRetriever`
-(`tests/retrieval/test_keyword.py` — wraps matching memory entries as
-`RetrievedChunk`s, respects `top_k`, empty-match and cross-scope
-isolation), the Researcher (`tests/agents/test_researcher.py` — the
+substrings of unrelated content, `embedding_json` round-tripping through
+`save()`/`recent()`, `embedded()` excluding entries with no embedding,
+and a migration test proving `Database.init()` adds the `embedding_json`
+column to a table created under the *old* schema without breaking),
+`KeywordRetriever` (`tests/retrieval/test_keyword.py` — wraps matching
+memory entries as `RetrievedChunk`s, respects `top_k`, empty-match and
+cross-scope isolation), `EmbeddingRetriever` and `embed_for_memory`
+(`tests/retrieval/test_embedding.py` — cosine-similarity ranking, `top_k`
+and scope, and failing open to `[]`/`None` on a missing provider, an
+adapter that doesn't support embeddings, or a real provider error;
+`OllamaAdapter`/`OpenAICompatibleAdapter`'s own `embed()` HTTP behavior
+is covered separately in `tests/providers/`), the Researcher (`tests/agents/test_researcher.py` — the
 system prompt honestly reflecting tool availability, answering from the
 model's own knowledge when no search tool is configured, and actually
 driving a `web_search` tool call end-to-end when one is), the Synthesizer
@@ -1657,11 +1706,14 @@ completed DAG's own node outputs when more than one node ran, so a
 multi-step Orchestrator run never returns a raw list of intermediate
 results. Memory/RAG (`app/storage/repositories/memory.py`,
 `app/retrieval/`) — a real, scope-isolated, SQLite-backed memory store
-and a swappable `Retriever` Protocol, with `KeywordRetriever` as the one
-real (keyword/substring, not semantic) implementation today, read before
-and written after every Orchestrator run at tier ≥ 2 — see the Memory/RAG
-section above for why keyword retrieval, not a faked-up "semantic"
-search, is what ships first.
+and a swappable `Retriever` Protocol, read before and written after every
+Orchestrator run at tier ≥ 2, with two real implementations:
+`KeywordRetriever` (keyword/substring, always on, free) and
+`EmbeddingRetriever` (`app/retrieval/embedding.py` — genuine embedding +
+cosine-similarity search via a provider's real `embed()` call, opt-in via
+`retrieval.enabled`) — see the Memory/RAG section above for the full
+design and why both are honest, non-faked implementations rather than
+one dressing up as the other.
 
 **Phase 4:** Evidence Graph (`app/intelligence/evidence.py`,
 `app/contracts/evidence.py`) — opt-in (`OrchestrationRequest.trace_evidence`)
@@ -1795,10 +1847,11 @@ the dependency order explained above, each with its own review checkpoint.
 Also still open: other tool types beyond
 `web_search`, multi-turn agent loops,
 tool-using agents that act on a plan's own intermediate results mid-run
-rather than a single forced-JSON planning call up front, a real
-embeddings-backed `Retriever` (Memory/RAG is keyword-based today, by
-design — see above), plugin loader, browser/web-AI adapter, network
-failover/VPN layer, and PostgreSQL migration. Race mode covers streaming
+rather than a single forced-JSON planning call up front, plugin loader,
+browser/web-AI adapter, network failover/VPN layer, and PostgreSQL
+migration. Memory/RAG now has a real embeddings-backed `Retriever`
+(opt-in, off by default — see the Memory/RAG section above) alongside
+the always-on keyword one. Race mode covers streaming
 too, and the Quality Gate now has an opt-in LLM-graded judgment layer on
 top of its structural checks (see above for both) — the quality gate as a
 whole remains **deliberately** non-streaming-only regardless, structural

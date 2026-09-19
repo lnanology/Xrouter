@@ -86,3 +86,43 @@ async def test_500_raises_retryable_server_error():
             await adapter.chat("gpt-test", ChatCompletionRequest(model="x", messages=[ChatMessage(role="user", content="hi")]))
     assert exc_info.value.retryable is True
     await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_embed_success_sorted_by_index():
+    adapter = OpenAICompatibleAdapter(_config())
+    with respx.mock(base_url="https://api.example.com/v1") as mock:
+        mock.post("/embeddings").mock(
+            return_value=httpx.Response(
+                200,
+                json={
+                    "data": [
+                        {"embedding": [0.2, 0.3], "index": 1},
+                        {"embedding": [0.0, 0.1], "index": 0},
+                    ]
+                },
+            )
+        )
+        vectors = await adapter.embed("embed-test", ["a", "b"])
+    assert vectors == [[0.0, 0.1], [0.2, 0.3]]
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_embed_requires_configuration():
+    adapter = OpenAICompatibleAdapter(_config(with_key=False))
+    with pytest.raises(ProviderUnavailableError):
+        await adapter.embed("embed-test", ["a"])
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_embed_500_raises_retryable_server_error():
+    from app.core.errors import ProviderServerError
+
+    adapter = OpenAICompatibleAdapter(_config())
+    with respx.mock(base_url="https://api.example.com/v1") as mock:
+        mock.post("/embeddings").mock(return_value=httpx.Response(500, text="oops"))
+        with pytest.raises(ProviderServerError):
+            await adapter.embed("embed-test", ["a"])
+    await adapter.close()

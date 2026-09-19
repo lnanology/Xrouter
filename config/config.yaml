@@ -80,3 +80,17 @@ self_healing:
   enabled: false
   interval_seconds: 30
   confirm_cycles: 3
+
+# Embedding-backed Memory retrieval (Tier 1): off by default -- enabling
+# this spends a real embed() provider call on every Orchestrator recall
+# AND every remember (tier >= 2), on top of what the always-on keyword
+# retriever already does for free (same reasoning as quality_gate_enabled).
+# The default model needs to actually be pulled in Ollama first:
+#   ollama pull nomic-embed-text
+# before enabling this, or every embed() call will just fail open (falls
+# back to empty retrieval results, never crashes).
+retrieval:
+  enabled: false
+  embedding_provider: ollama
+  embedding_model: nomic-embed-text
+  max_candidates: 200

@@ -84,3 +84,32 @@ async def test_chat_connection_error_raises_typed_error():
         with pytest.raises(ProviderConnectionError):
             await adapter.chat("llama3", req)
     await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_capabilities_includes_embeddings():
+    adapter = OllamaAdapter(_config())
+    from app.contracts.provider import ProviderCapability
+
+    assert ProviderCapability.EMBEDDINGS in adapter.capabilities()
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_embed_success():
+    adapter = OllamaAdapter(_config())
+    with respx.mock(base_url="http://localhost:11434") as mock:
+        mock.post("/api/embed").mock(return_value=httpx.Response(200, json={"embeddings": [[0.1, 0.2], [0.3, 0.4]]}))
+        vectors = await adapter.embed("nomic-embed-text", ["a", "b"])
+    assert vectors == [[0.1, 0.2], [0.3, 0.4]]
+    await adapter.close()
+
+
+@pytest.mark.asyncio
+async def test_embed_connection_error_raises_typed_error():
+    adapter = OllamaAdapter(_config())
+    with respx.mock(base_url="http://localhost:11434") as mock:
+        mock.post("/api/embed").mock(side_effect=httpx.ConnectError("refused"))
+        with pytest.raises(ProviderConnectionError):
+            await adapter.embed("nomic-embed-text", ["a"])
+    await adapter.close()

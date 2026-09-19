@@ -167,6 +167,66 @@ async def test_remember_does_nothing_for_an_empty_answer(tmp_path):
     assert recent == []
 
 
+# --- _recall / _remember with RetrievalConfig.enabled (EmbeddingRetriever) --
+
+async def _engine_with_retrieval(tmp_path, embed_vectors):
+    return await build_test_engine(
+        tmp_path, {"solo": {"content": "ok", "embed_vectors": embed_vectors}},
+        retrieval_overrides={"enabled": True, "embedding_provider": "solo", "embedding_model": "test-model"},
+    )
+
+
+@pytest.mark.asyncio
+async def test_remember_stores_an_embedding_when_retrieval_enabled(tmp_path):
+    summary = "Task: what's 2+2\nAnswer: 4"
+    engine = await _engine_with_retrieval(tmp_path, {summary: [1.0, 0.0]})
+    request = OrchestrationRequest(task="what's 2+2", scope="a-scope")
+    await _remember(engine, request, "4")
+    recent = await engine.ctx.memory_repo.recent("a-scope", limit=5)
+    assert recent[0].embedding == [1.0, 0.0]
+
+
+@pytest.mark.asyncio
+async def test_recall_uses_embedding_retriever_when_retrieval_enabled(tmp_path):
+    # _MEMORY_RECALL_TOP_K is 3, so with only two candidates both show up
+    # -- what proves this is EmbeddingRetriever (cosine ranking) and not
+    # KeywordRetriever (word-overlap match) is the *order*: the close
+    # cosine match must be ranked ahead of the far one.
+    engine = await _engine_with_retrieval(tmp_path, {"the gateway": [1.0, 0.0]})
+    await engine.ctx.memory_repo.save("global", "far match", embedding=[0.0, 1.0])
+    await engine.ctx.memory_repo.save("global", "close match", embedding=[1.0, 0.0])
+    request = OrchestrationRequest(task="the gateway", scope="global")
+    result = await _recall(engine, request)
+    assert "close match" in result and "far match" in result
+    assert result.index("close match") < result.index("far match")
+
+
+@pytest.mark.asyncio
+async def test_recall_falls_open_to_empty_when_embedding_provider_lacks_the_capability(tmp_path):
+    # embed_vectors=None -> the fake never declared EMBEDDINGS, mirroring
+    # an adapter that doesn't support it -- retrieve() must fail open to
+    # [] rather than raise, so _recall just returns the original context.
+    engine = await build_test_engine(
+        tmp_path, {"solo": {"content": "ok"}},
+        retrieval_overrides={"enabled": True, "embedding_provider": "solo", "embedding_model": "test-model"},
+    )
+    await engine.ctx.memory_repo.save("global", "some memory", embedding=[1.0, 0.0])
+    request = OrchestrationRequest(task="anything", scope="global", context="original context")
+    result = await _recall(engine, request)
+    assert result == "original context"
+
+
+@pytest.mark.asyncio
+async def test_remember_saves_without_embedding_when_retrieval_disabled(tmp_path):
+    # Default engine (retrieval disabled) -- regression guard that the new
+    # optional embedding path never activates unless explicitly enabled.
+    engine = await build_test_engine(tmp_path, {"solo": {"content": "ok", "embed_vectors": {"x": [1.0]}}})
+    request = OrchestrationRequest(task="task", scope="a-scope")
+    await _remember(engine, request, "answer")
+    recent = await engine.ctx.memory_repo.recent("a-scope", limit=5)
+    assert recent[0].embedding is None
+
+
 # --- orchestrate(): tier 0-1 (trivial/simple -- solver only) ----------------
 
 @pytest.mark.asyncio

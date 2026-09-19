@@ -10,6 +10,7 @@ from app.contracts.model import ModelInfo
 from app.contracts.provider import ProviderCapability, ProviderConfig, ProviderHealth, ProviderUsage
 from app.contracts.request import ChatCompletionRequest
 from app.contracts.response import ChatCompletionChunk, ChatCompletionResponse
+from app.core.errors import ProviderCapabilityUnsupportedError
 
 
 class Provider(ABC):
@@ -53,6 +54,20 @@ class Provider(ABC):
     @abstractmethod
     def stream_chat(self, model: str, request: ChatCompletionRequest) -> AsyncIterator[ChatCompletionChunk]:
         """Streaming chat completion."""
+
+    async def embed(self, model: str, texts: list[str]) -> list[list[float]]:
+        """Embed a batch of texts, one vector per input, same order.
+
+        Concrete (not abstract) -- embeddings are an optional capability,
+        like TOOLS/VISION, not something every adapter must implement.
+        Default: unsupported. Only an adapter that actually declares
+        ProviderCapability.EMBEDDINGS in capabilities() should override
+        this -- and it must raise a subclass of
+        app.core.errors.ProviderError on failure, never invent a fake
+        vector."""
+        raise ProviderCapabilityUnsupportedError(
+            f"Provider '{self.id}' does not support embeddings", provider_id=self.id
+        )
 
     def usage(self) -> ProviderUsage:
         return self._usage

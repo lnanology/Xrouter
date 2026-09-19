@@ -34,7 +34,7 @@ class OllamaAdapter(Provider):
         self._client = httpx.AsyncClient(base_url=base_url, timeout=config.timeout_seconds)
 
     def capabilities(self) -> set[ProviderCapability]:
-        return {ProviderCapability.CHAT, ProviderCapability.STREAMING}
+        return {ProviderCapability.CHAT, ProviderCapability.STREAMING, ProviderCapability.EMBEDDINGS}
 
     async def list_models(self) -> list[ModelInfo]:
         try:
@@ -170,6 +170,28 @@ class OllamaAdapter(Provider):
         except httpx.ConnectError as e:
             self._usage.requests_failed += 1
             raise ProviderConnectionError(f"Cannot reach Ollama: {e}", provider_id=self.id) from e
+
+    async def embed(self, model: str, texts: list[str]) -> list[list[float]]:
+        self._usage.requests_total += 1
+        body = {"model": model, "input": texts}
+        try:
+            resp = await self._client.post("/api/embed", json=body)
+        except httpx.TimeoutException as e:
+            self._usage.requests_failed += 1
+            raise ProviderTimeoutError(str(e), provider_id=self.id) from e
+        except httpx.ConnectError as e:
+            self._usage.requests_failed += 1
+            raise ProviderConnectionError(f"Cannot reach Ollama at {self._client.base_url}: {e}", provider_id=self.id) from e
+
+        if resp.status_code >= 500:
+            self._usage.requests_failed += 1
+            raise ProviderServerError(f"Ollama HTTP {resp.status_code}", provider_id=self.id)
+        if resp.status_code >= 400:
+            self._usage.requests_failed += 1
+            raise ProviderError(f"Ollama HTTP {resp.status_code}: {resp.text[:200]}", provider_id=self.id)
+
+        data = resp.json()
+        return data.get("embeddings", [])
 
     async def close(self) -> None:
         await self._client.aclose()

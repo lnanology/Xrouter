@@ -131,7 +131,8 @@ CREATE TABLE IF NOT EXISTS memory_entries (
     scope TEXT NOT NULL,
     content TEXT NOT NULL,
     tags_json TEXT NOT NULL,
-    created_at REAL NOT NULL
+    created_at REAL NOT NULL,
+    embedding_json TEXT
 );
 """
 
@@ -146,6 +147,17 @@ class Database:
             async with aiosqlite.connect(self.db_path) as db:
                 await db.executescript(SCHEMA)
                 await db.commit()
+                # `CREATE TABLE IF NOT EXISTS` above only shapes a *new*
+                # database -- it does nothing to a memory_entries table
+                # that already existed before embedding_json was added
+                # (e.g. a real, previously-initialized data/xrouter.sqlite3
+                # on a user's machine). Add the column if it's missing so
+                # an upgrade never breaks an existing DB.
+                cursor = await db.execute("PRAGMA table_info(memory_entries)")
+                cols = {row[1] for row in await cursor.fetchall()}
+                if "embedding_json" not in cols:
+                    await db.execute("ALTER TABLE memory_entries ADD COLUMN embedding_json TEXT")
+                    await db.commit()
 
         try:
             await asyncio.wait_for(_init(), timeout=timeout)

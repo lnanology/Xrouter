@@ -66,6 +66,16 @@ class ProviderUnavailableError(ProviderError):
     retryable = False
 
 
+class ProviderCapabilityUnsupportedError(ProviderError):
+    """The provider is configured and reachable but this adapter doesn't
+    implement the requested capability (e.g. embed() on an adapter that
+    never declared ProviderCapability.EMBEDDINGS). Never retryable --
+    trying a different candidate isn't going to make this adapter support
+    something it doesn't."""
+
+    retryable = False
+
+
 # --- Routing / execution errors --------------------------------------------
 
 class CircuitOpenError(ProviderUnavailableError):

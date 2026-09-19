@@ -209,6 +209,24 @@ class SelfHealingConfig:
 
 
 @dataclass
+class RetrievalConfig:
+    """Embedding-backed Memory retrieval (Tier 1 gap-list item 3): off by
+    default -- enabling this spends a real embed() provider call on every
+    Orchestrator recall *and* every remember (tier >= 2), on top of
+    whatever KeywordRetriever already did for free -- same "must not turn
+    on silently" reasoning as race_mode_enabled/quality_gate_enabled.
+    `embedding_provider`/`embedding_model` are resolved directly against
+    ProviderRegistry (no router involved -- there's exactly one caller
+    and one fixed use, so a router-based capability-selection path would
+    be new infrastructure this doesn't need). See
+    app/retrieval/embedding.py."""
+    enabled: bool = False
+    embedding_provider: str = "ollama"
+    embedding_model: str = "nomic-embed-text"
+    max_candidates: int = 200
+
+
+@dataclass
 class Settings:
     server: ServerConfig
     routing: RoutingConfig
@@ -218,6 +236,7 @@ class Settings:
     policy_learning: PolicyLearningConfig
     evolution: EvolutionConfig
     self_healing: SelfHealingConfig
+    retrieval: RetrievalConfig
     providers: dict[str, ProviderConfig]
     raw_routing: dict[str, Any]
     model_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -314,6 +333,14 @@ class Settings:
             confirm_cycles=int(self_healing_raw.get("confirm_cycles", 3)),
         )
 
+        retrieval_raw = raw_config.get("retrieval", {})
+        retrieval = RetrievalConfig(
+            enabled=bool(retrieval_raw.get("enabled", False)),
+            embedding_provider=retrieval_raw.get("embedding_provider", RetrievalConfig.embedding_provider),
+            embedding_model=retrieval_raw.get("embedding_model", RetrievalConfig.embedding_model),
+            max_candidates=int(retrieval_raw.get("max_candidates", 200)),
+        )
+
         providers: dict[str, ProviderConfig] = {}
         for pid, pcfg in (raw_providers.get("providers") or {}).items():
             providers[pid] = ProviderConfig(
@@ -351,8 +378,8 @@ class Settings:
 
         return cls(
             server=server, routing=routing, cache=cache, benchmark=benchmark, ab_routing=ab_routing,
-            policy_learning=policy_learning, evolution=evolution, self_healing=self_healing, providers=providers,
-            raw_routing=raw_routing, model_overrides=model_overrides, tools=tools,
+            policy_learning=policy_learning, evolution=evolution, self_healing=self_healing, retrieval=retrieval,
+            providers=providers, raw_routing=raw_routing, model_overrides=model_overrides, tools=tools,
         )
 
 
