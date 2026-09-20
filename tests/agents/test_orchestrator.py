@@ -331,6 +331,46 @@ async def test_orchestrate_tier3_multi_node_plan_uses_synthesizer(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_orchestrate_tier4_passes_adaptive_true_tier3_passes_adaptive_false(tmp_path, monkeypatch):
+    # Adaptive mid-run planning is bundled into Tier 4 ("very hard")
+    # exactly like verify already is -- gated by the same verify_tier
+    # boolean, never a separate opt-in field -- so Tier 3 must never see
+    # PlanRequest.adaptive=True and Tier 4 must always see it True.
+    import app.agents.orchestrator as orchestrator_module
+
+    captured: list[bool] = []
+    original = orchestrator_module.run_plan_with_verification
+
+    async def _capture(engine, plan_request, **kwargs):
+        captured.append(plan_request.adaptive)
+        return await original(engine, plan_request, **kwargs)
+
+    monkeypatch.setattr(orchestrator_module, "run_plan_with_verification", _capture)
+
+    plan_json = [{"id": "solve", "prompt": "work the problem"}]
+    tier3_engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"tool_calls": [_plan_tool_call(plan_json)]},
+        {"content": "an answer"},
+        {"tool_calls": [_critique_tool_call(True)]},
+    ]}})
+    await orchestrate(tier3_engine, OrchestrationRequest(task=TASK_TIER3))
+
+    tier4_engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"tool_calls": [_plan_tool_call(plan_json)]},
+        {"content": "an answer"},
+        {"tool_calls": [_critique_tool_call(True)]},
+        {"tool_calls": [_plan_tool_call([])]},          # adaptive continuation, nothing more needed
+        {"tool_calls": [_verify_tool_call(True)]},
+        {"content": "the case for this answer"},
+        {"content": "a counterpoint to consider"},
+        {"content": "the final, strengthened answer"},
+    ]}})
+    await orchestrate(tier4_engine, OrchestrationRequest(task=TASK_TIER4))
+
+    assert captured == [False, True]
+
+
+@pytest.mark.asyncio
 async def test_orchestrate_tier3_all_nodes_failed_raises_orchestration_error(tmp_path):
     plan_json = [{"id": "solve", "prompt": "work the problem"}]
 
@@ -360,10 +400,11 @@ async def test_orchestrate_tier4_includes_research_verifier_and_debate(tmp_path)
             {"tool_calls": [_plan_tool_call(plan_json)]},       # 1: plan
             {"content": "researched answer"},                    # 2: node (offered web_search, doesn't call it)
             {"tool_calls": [_critique_tool_call(True)]},          # 3: forced critique on the terminal node
-            {"tool_calls": [_verify_tool_call(True)]},            # 4: verifier, satisfied
-            {"content": "the case for this answer"},              # 5: debate advocate
-            {"content": "a counterpoint to consider"},             # 6: debate skeptic
-            {"content": "the final, strengthened answer"},          # 7: debate judge
+            {"tool_calls": [_plan_tool_call([])]},                # 4: adaptive continuation, nothing more needed
+            {"tool_calls": [_verify_tool_call(True)]},            # 5: verifier, satisfied
+            {"content": "the case for this answer"},              # 6: debate advocate
+            {"content": "a counterpoint to consider"},             # 7: debate skeptic
+            {"content": "the final, strengthened answer"},          # 8: debate judge
         ]}},
         tool_specs={"web_search": {}},
     )
@@ -379,28 +420,29 @@ async def test_orchestrate_tier4_includes_research_verifier_and_debate(tmp_path)
     assert result.debate.position == "researched answer"
     assert result.debate.resolution == "the final, strengthened answer"
     solo = engine.ctx.providers.get("solo")
-    assert solo.call_count == 7
+    assert solo.call_count == 8
 
 
 @pytest.mark.asyncio
 async def test_orchestrate_tier4_debate_fails_open_without_losing_the_pre_debate_answer(tmp_path):
     plan_json = [{"id": "solve", "prompt": "answer"}]
 
-    def _fail_from_sixth_call(count: int) -> None:
-        if count >= 6:
+    def _fail_from_seventh_call(count: int) -> None:
+        if count >= 7:
             from app.core.errors import ProviderServerError
 
             raise ProviderServerError("simulated 500", provider_id="solo")
 
     engine = await build_test_engine(tmp_path, {"solo": {
-        "behavior": _fail_from_sixth_call,
+        "behavior": _fail_from_seventh_call,
         "responses": [
             {"tool_calls": [_plan_tool_call(plan_json)]},       # 1: plan
             {"content": "researched answer"},                    # 2: node
             {"tool_calls": [_critique_tool_call(True)]},          # 3: forced critique
-            {"tool_calls": [_verify_tool_call(True)]},            # 4: verifier, satisfied
-            {"content": "the case for this answer"},              # 5: debate advocate (succeeds)
-            # call 6 (debate skeptic) fails -- the whole debate must roll back
+            {"tool_calls": [_plan_tool_call([])]},                # 4: adaptive continuation, nothing more needed
+            {"tool_calls": [_verify_tool_call(True)]},            # 5: verifier, satisfied
+            {"content": "the case for this answer"},              # 6: debate advocate (succeeds)
+            # call 7 (debate skeptic) fails -- the whole debate must roll back
         ],
     }})
 
@@ -534,11 +576,12 @@ async def test_orchestrate_tier4_trace_counterfactual_runs_after_debate(tmp_path
         {"tool_calls": [_plan_tool_call(plan_json)]},           # 1: plan
         {"content": "researched answer"},                        # 2: node
         {"tool_calls": [_critique_tool_call(True)]},              # 3: forced critique
-        {"tool_calls": [_verify_tool_call(True)]},                # 4: verifier
-        {"content": "the case for this answer"},                  # 5: debate advocate
-        {"content": "a counterpoint to consider"},                # 6: debate skeptic
-        {"content": "the final, strengthened answer"},            # 7: debate judge
-        {"tool_calls": [_counterfactual_tool_call([{"assumption": "a", "if_false": "b"}])]},  # 8: counterfactual
+        {"tool_calls": [_plan_tool_call([])]},                    # 4: adaptive continuation, nothing more needed
+        {"tool_calls": [_verify_tool_call(True)]},                # 5: verifier
+        {"content": "the case for this answer"},                  # 6: debate advocate
+        {"content": "a counterpoint to consider"},                # 7: debate skeptic
+        {"content": "the final, strengthened answer"},            # 8: debate judge
+        {"tool_calls": [_counterfactual_tool_call([{"assumption": "a", "if_false": "b"}])]},  # 9: counterfactual
     ]}})
 
     result = await orchestrate(engine, OrchestrationRequest(task=TASK_TIER4, trace_counterfactual=True))
@@ -547,7 +590,7 @@ async def test_orchestrate_tier4_trace_counterfactual_runs_after_debate(tmp_path
     assert result.answer == "the final, strengthened answer"
     assert result.counterfactual is not None
     solo = engine.ctx.providers.get("solo")
-    assert solo.call_count == 8
+    assert solo.call_count == 9
 
 
 @pytest.mark.asyncio
@@ -684,21 +727,22 @@ async def test_orchestrate_tier2_happy_path_confidence_is_high_with_no_reasons(t
 async def test_orchestrate_tier4_debate_fails_open_confidence_reflects_it(tmp_path):
     plan_json = [{"id": "solve", "prompt": "answer"}]
 
-    def _fail_from_sixth_call(count: int) -> None:
-        if count >= 6:
+    def _fail_from_seventh_call(count: int) -> None:
+        if count >= 7:
             from app.core.errors import ProviderServerError
 
             raise ProviderServerError("simulated 500", provider_id="solo")
 
     engine = await build_test_engine(tmp_path, {"solo": {
-        "behavior": _fail_from_sixth_call,
+        "behavior": _fail_from_seventh_call,
         "responses": [
             {"tool_calls": [_plan_tool_call(plan_json)]},       # 1: plan
             {"content": "researched answer"},                    # 2: node
             {"tool_calls": [_critique_tool_call(True)]},          # 3: forced critique
-            {"tool_calls": [_verify_tool_call(True)]},            # 4: verifier, satisfied
-            {"content": "the case for this answer"},              # 5: debate advocate (succeeds)
-            # call 6 (debate skeptic) fails -- the whole debate must roll back
+            {"tool_calls": [_plan_tool_call([])]},                # 4: adaptive continuation, nothing more needed
+            {"tool_calls": [_verify_tool_call(True)]},            # 5: verifier, satisfied
+            {"content": "the case for this answer"},              # 6: debate advocate (succeeds)
+            # call 7 (debate skeptic) fails -- the whole debate must roll back
         ],
     }})
 

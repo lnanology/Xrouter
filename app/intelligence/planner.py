@@ -44,13 +44,19 @@ PLAN_TOOL_NAME = "submit_plan"
 _ROUTING_POLICIES = ["fastest", "cheapest", "reliable", "quota_aware", "quality", "balanced"]
 
 
-def _build_plan_tool_schema(available_tools: list[str]) -> dict[str, Any]:
+def _build_plan_tool_schema(available_tools: list[str], allow_empty: bool = False) -> dict[str, Any]:
     """Builds the submit_plan tool schema for *this* call, offering only
     the tools that are actually registered and configured right now
     (available_tools comes from ToolRegistry.available_names()). A plan
     can therefore never even syntactically request a tool that doesn't
     exist -- there's nothing to hallucinate an id for if the enum doesn't
-    list it -- consistent with "no fake placeholder functionality"."""
+    list it -- consistent with "no fake placeholder functionality".
+
+    allow_empty (used only for an adaptive-planning continuation call,
+    see app/execution/adaptive_planner.py) permits an empty `nodes`
+    array as the model's legitimate way of saying "nothing more is
+    needed" -- the initial plan for a task must still produce at least
+    one node."""
     node_properties: dict[str, Any] = {
         "id": {
             "type": "string",
@@ -91,23 +97,24 @@ def _build_plan_tool_schema(available_tools: list[str]) -> dict[str, Any]:
             ),
         }
 
+    nodes_schema: dict[str, Any] = {
+        "type": "array",
+        "minItems": 0 if allow_empty else 1,
+        "items": {"type": "object", "properties": node_properties, "required": ["id", "prompt"]},
+    }
+    description = "Submit the execution plan: an explicit DAG of chat-completion nodes that together accomplish the user's task."
+    if allow_empty:
+        nodes_schema["description"] = "Submit an empty array if no further steps are needed to complete the task."
+        description += " Submit an empty nodes array if the task is already fully complete."
+
     return {
         "type": "function",
         "function": {
             "name": PLAN_TOOL_NAME,
-            "description": (
-                "Submit the execution plan: an explicit DAG of chat-completion "
-                "nodes that together accomplish the user's task."
-            ),
+            "description": description,
             "parameters": {
                 "type": "object",
-                "properties": {
-                    "nodes": {
-                        "type": "array",
-                        "minItems": 1,
-                        "items": {"type": "object", "properties": node_properties, "required": ["id", "prompt"]},
-                    }
-                },
+                "properties": {"nodes": nodes_schema},
                 "required": ["nodes"],
             },
         },
@@ -122,7 +129,7 @@ class PlannerError(XRouterError):
 
 
 def _build_planning_request(
-    plan_request: PlanRequest, max_nodes: int, available_tools: list[str] | None = None,
+    plan_request: PlanRequest, max_nodes: int, available_tools: list[str] | None = None, allow_empty: bool = False,
 ) -> ChatCompletionRequest:
     # available_tools defaults to "none" rather than being required -- lets
     # existing/simple callers (and tests) that don't care about tools at
@@ -154,7 +161,7 @@ def _build_planning_request(
         model=plan_request.model,
         messages=messages,
         routing_policy=plan_request.routing_policy,
-        tools=[_build_plan_tool_schema(available_tools)],
+        tools=[_build_plan_tool_schema(available_tools, allow_empty=allow_empty)],
         tool_choice={"type": "function", "function": {"name": PLAN_TOOL_NAME}},
     )
 
@@ -191,26 +198,32 @@ def to_dag_request(plan: PlanSpec) -> DagRunRequest:
     ])
 
 
-def _validate_plan_shape(plan: PlanSpec, max_nodes: int, available_tools: list[str] | None = None) -> None:
+def _validate_plan_shape(
+    plan: PlanSpec, max_nodes: int, available_tools: list[str] | None = None, known_ids: frozenset[str] | None = None,
+) -> None:
     """Raises PlannerError if the plan can't become a runnable DAG -- too
     many nodes, a structurally bad graph (cycle, duplicate id, unknown or
-    self dependency), or a node requesting a tool that wasn't actually
-    offered. The last check matters even though the schema's enum already
-    constrains valid values: not every provider strictly enforces a JSON
-    schema enum on generated tool-call arguments, so a model can still
-    hallucinate a name outside it -- this catches that before it becomes
-    a node that silently runs with no tool at all (see
-    app/execution/tool_loop.py's own "not registered -> ignore" behavior,
-    which is the right call *at execution time* but would hide a planning
-    mistake if not also caught here). Reuses app.execution.dag's own
-    validator for the graph-shape check, so a plan rejected here is
-    guaranteed to be rejected inside the DagExecutor for the identical
-    reason, and vice versa."""
+    self dependency), a node requesting a tool that wasn't actually
+    offered, or (for an adaptive-planning continuation call, known_ids
+    given) a node reusing an id from an earlier round. The tool check
+    matters even though the schema's enum already constrains valid
+    values: not every provider strictly enforces a JSON schema enum on
+    generated tool-call arguments, so a model can still hallucinate a
+    name outside it -- this catches that before it becomes a node that
+    silently runs with no tool at all (see app/execution/tool_loop.py's
+    own "not registered -> ignore" behavior, which is the right call *at
+    execution time* but would hide a planning mistake if not also caught
+    here). Reuses app.execution.dag's own validator for the graph-shape
+    check, so a plan rejected here is guaranteed to be rejected inside
+    the DagExecutor for the identical reason, and vice versa."""
     if len(plan.nodes) > max_nodes:
         raise PlannerError(f"plan has {len(plan.nodes)} nodes, exceeding the {max_nodes}-node cap")
 
+    known_ids = known_ids or frozenset()
     available = set(available_tools or [])
     for n in plan.nodes:
+        if n.id in known_ids:
+            raise PlannerError(f"node id '{n.id}' was already used in an earlier round; choose a new, unique id")
         unknown = [t for t in n.enable_tools if t not in available]
         if unknown:
             raise PlannerError(
@@ -219,13 +232,14 @@ def _validate_plan_shape(plan: PlanSpec, max_nodes: int, available_tools: list[s
             )
 
     try:
-        _validate_and_order(to_dag_request(plan).nodes, max_nodes)
+        _validate_and_order(to_dag_request(plan).nodes, max_nodes, known_ids=known_ids)
     except DagValidationError as e:
         raise PlannerError(f"plan doesn't form a valid graph: {e}") from e
 
 
 async def generate_plan(
     engine: "ChatEngine", plan_request: PlanRequest, max_nodes: int, max_retries: int = 2,
+    known_ids: frozenset[str] | None = None, allow_empty: bool = False,
 ) -> tuple[PlanSpec, int]:
     """Calls the engine (forced submit_plan tool call) to get a plan,
     re-prompting with the specific error up to max_retries times if the
@@ -234,9 +248,17 @@ async def generate_plan(
     path every other XRouter entrypoint uses when nothing can even answer
     -- and only raises PlannerError once every retry has been spent on a
     plan that still isn't usable. Returns (plan, attempts_used) so callers
-    can see whether the model got it right first try."""
+    can see whether the model got it right first try.
+
+    known_ids and allow_empty are only ever set by an adaptive-planning
+    continuation call (app/execution/adaptive_planner.py): known_ids lets
+    a new node depend on an id from an earlier round (and rejects a new
+    node reusing one of those ids), and allow_empty lets the model submit
+    zero nodes as a legitimate "nothing more is needed" signal -- in
+    which case validation is skipped entirely (there's nothing to
+    validate about an empty plan) and it's returned immediately."""
     available_tools = engine.ctx.tools.available_names()
-    request = _build_planning_request(plan_request, max_nodes, available_tools)
+    request = _build_planning_request(plan_request, max_nodes, available_tools, allow_empty=allow_empty)
     last_error: PlannerError | None = None
 
     for attempt in range(max_retries + 1):
@@ -246,7 +268,9 @@ async def generate_plan(
             if raw is None:
                 raise PlannerError("planner did not call submit_plan with a tool call")
             plan = _parse_plan(raw)
-            _validate_plan_shape(plan, max_nodes, available_tools)
+            if allow_empty and not plan.nodes:
+                return plan, attempt + 1
+            _validate_plan_shape(plan, max_nodes, available_tools, known_ids=known_ids)
         except PlannerError as e:
             last_error = e
             logger.warning("plan attempt %d/%d rejected: %s", attempt + 1, max_retries + 1, e)

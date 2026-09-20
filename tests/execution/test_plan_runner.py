@@ -81,6 +81,66 @@ async def test_verify_true_unsatisfied_then_satisfied_replans_once(tmp_path):
     assert "needs more detail" in joined
 
 
+# --- adaptive (mid-run continuation rounds) -----------------------------------
+
+@pytest.mark.asyncio
+async def test_adaptive_false_never_asks_for_a_continuation(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"tool_calls": [_plan_tool_call([{"id": "a", "prompt": "hi"}])]},
+        {"content": "ok"},
+    ]}})
+    plan_request = PlanRequest(task="do something", model="solo/test-model", adaptive=False)
+
+    result = await run_plan_with_verification(engine, plan_request, max_nodes=20, max_plan_retries=2, max_verify_retries=1)
+
+    assert result.adaptive_rounds == 0
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 2  # plan + one DAG node, no continuation call at all
+
+
+@pytest.mark.asyncio
+async def test_adaptive_true_adds_a_node_from_a_continuation_round(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"tool_calls": [_plan_tool_call([{"id": "a", "prompt": "step a"}])]},          # initial plan
+        {"content": "result a"},                                                       # node "a"
+        {"tool_calls": [_plan_tool_call([{"id": "b", "prompt": "step b"}])]},          # continuation: adds "b"
+        {"content": "result b"},                                                       # node "b"
+        {"tool_calls": [_plan_tool_call([])]},                                         # continuation: done
+    ]}})
+    plan_request = PlanRequest(task="do something", model="solo/test-model", adaptive=True)
+
+    result = await run_plan_with_verification(
+        engine, plan_request, max_nodes=20, max_plan_retries=2, max_verify_retries=1, max_adaptive_rounds=3,
+    )
+
+    assert result.adaptive_rounds == 1
+    assert [n.id for n in result.plan.nodes] == ["a", "b"]
+    assert result.dag.status == "success"
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 5
+
+
+@pytest.mark.asyncio
+async def test_adaptive_and_verify_combined_verifies_the_merged_result(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"tool_calls": [_plan_tool_call([{"id": "a", "prompt": "step a"}])]},          # initial plan
+        {"content": "result a"},                                                       # node "a"
+        {"tool_calls": [_plan_tool_call([])]},                                         # continuation: done, no more nodes
+        {"tool_calls": [_verify_tool_call(True)]},                                     # verify: satisfied
+    ]}})
+    plan_request = PlanRequest(task="do something", model="solo/test-model", adaptive=True, verify=True)
+
+    result = await run_plan_with_verification(
+        engine, plan_request, max_nodes=20, max_plan_retries=2, max_verify_retries=1, max_adaptive_rounds=3,
+    )
+
+    assert result.adaptive_rounds == 0
+    assert result.replan_count == 0
+    assert result.verification.satisfied is True
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 4  # plan + node + continuation(empty) + verify
+
+
 @pytest.mark.asyncio
 async def test_verify_true_gives_up_after_exhausting_retries(tmp_path):
     # Every verification comes back unsatisfied; with max_verify_retries=1

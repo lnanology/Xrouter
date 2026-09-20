@@ -549,6 +549,52 @@ behavior, the feedback actually reaching the re-plan's prompt) is
 orchestrated by `app/execution/plan_runner.py`, independently of the
 `POST /v1/plan/run` HTTP layer.
 
+#### Adaptive mid-run planning (opt-in: `"adaptive": true`)
+
+Verify's replan loop above is all-or-nothing: if the finished plan didn't
+satisfy the task, the *entire* plan is discarded and a brand new one is
+generated and run from scratch. Adaptive mid-run planning is the
+incremental complement — after a round of DAG nodes finishes, XRouter
+asks the Planner again, with the round's *actual, real* completed
+outputs as context (not a hypothetical), whether more steps are genuinely
+needed. If so, only the new steps it proposes run, against the outputs
+already produced — nothing already done is ever discarded or re-run:
+
+```bash
+curl http://localhost:20128/v1/plan/run \
+  -H "Content-Type: application/json" \
+  -d '{"task": "Research the two leading options and recommend one", "adaptive": true}'
+```
+
+```json
+{
+  "id": "plan_...",
+  "plan": {"...": "every round's nodes merged into one plan"},
+  "dag": {"...": "every round's node results merged into one DagRunResponse"},
+  "adaptive_rounds": 1,
+  "latency_ms": 2104.7
+}
+```
+
+A continuation round's own `submit_plan` call is allowed to submit zero
+nodes — that's the model's way of saying the task is already complete —
+which is how the loop terminates on its own rather than always running
+until the cap. Bounded by `routing.max_adaptive_rounds` (default `2`;
+cheaper than a verify replan since only the new nodes actually execute,
+nothing already done is re-run) and fails open exactly like the Verifier
+above: a planning error or an outage mid-round simply stops adding
+rounds and returns whatever was genuinely accomplished, never fails a
+request that already has real, useful results. Off by default at the
+`/v1/plan/run` layer for the same "must not turn on silently" reason as
+`verify`. The Dynamic Agent Team below bundles it into Tier 4 ("very
+hard") automatically, alongside `verify` and Debate, the same way
+`verify_tier` already gates those — Tier 3 ("hard") is unaffected, and
+there's no separate opt-in field on `/v1/agents/run` for it. Everything
+lives in `app/execution/adaptive_planner.py`, composing with (not
+replacing) `app/execution/plan_runner.py`'s existing verify/replan loop:
+a verify-triggered replan starts a fresh adaptive-rounds sequence of its
+own on the new plan, same as it always has.
+
 ### Dynamic Agent Team (`POST /v1/agents/run`)
 
 The piece the Task Classifier's own module docstring used to flag as "not
@@ -599,7 +645,10 @@ used. The tiers, straight from the routing table in the spec:
   `enable_tools` on some step.
 - **4 (very hard):** everything tier 3 does, plus a mandatory Verifier
   pass (reusing `run_plan_with_verification`'s own bounded
-  re-plan-on-failure loop wholesale) and a stronger hint folded into the
+  re-plan-on-failure loop wholesale), adaptive mid-run planning turned on
+  automatically (`PlanRequest.adaptive=true`, gated by the same
+  `verify_tier` boolean — see the Planner section's Adaptive mid-run
+  planning subsection above), and a stronger hint folded into the
   Planner's own context that a step may genuinely need Research — never
   forced, since forcing a tool call a task doesn't actually need would be
   exactly the "fake placeholder functionality" the project's rules forbid.
@@ -1314,7 +1363,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-500 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+520 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -1370,7 +1419,24 @@ once with no verification call at all, `verify: true` satisfied on the
 first try skipping any re-plan, an unsatisfied-then-satisfied cycle
 actually re-planning once with the verifier's feedback provably reaching
 the second planning call's prompt, and giving up after exhausting
-`max_verify_retries` rather than looping forever), the Web Search tool
+`max_verify_retries` rather than looping forever), adaptive mid-run
+planning (`tests/execution/test_adaptive_planner.py` — a continuation
+round actually carrying a prior round's real output into the next
+planning call's prompt and that output reaching `{{node_id}}`
+substitution in a newly-added node without re-running the node it came
+from, an immediate empty continuation stopping at zero extra rounds,
+`max_adaptive_rounds` capping continuation even when the planner keeps
+asking for more, a reused node id rejected and successfully retried
+with a fresh one, a `PlannerError` or `NoAvailableModelError` mid-round
+stopping the loop without losing what earlier rounds already
+accomplished, and a `plan_mutator` applied to each continuation round —
+plus its wiring into `run_plan_with_verification`
+(`tests/execution/test_plan_runner.py`: `adaptive: false` never asking
+for a continuation, `adaptive: true` merging a continuation round's node
+into the final plan and dag, and `adaptive` and `verify` combined
+verifying the merged result) and into the Dynamic Agent Team
+(`tests/agents/test_orchestrator.py`: Tier 4 always passing
+`adaptive: true` and Tier 3 never doing so)), the Web Search tool
 (`tests/tools/test_web_search.py` — configured/unconfigured graceful
 degradation, missing/non-string query rejection, result formatting,
 empty-results text, `max_results` clamping and invalid-value fallback, and
@@ -1712,7 +1778,16 @@ plan+execute cycle, up to `routing.max_verify_retries` times, via
 DagExecutor + Verifier together (`POST /v1/plan/run` is a thin HTTP
 wrapper around it). Fails open (missing/malformed tool call, or no
 provider able to answer at all counts as "satisfied") so a best-effort
-check can never hold an already-completed result hostage. Web Search +
+check can never hold an already-completed result hostage. Adaptive
+mid-run planning (`app/execution/adaptive_planner.py`, opt-in via
+`PlanRequest.adaptive`) — the incremental complement to Verifier's
+all-or-nothing replan: after a round of nodes finishes, the Planner is
+asked again with that round's *real* completed outputs as context, and
+if it decides more steps are genuinely needed, only those new steps run
+against the accumulated outputs, up to `routing.max_adaptive_rounds`
+times, without ever discarding or re-running anything already done;
+bundled automatically into Tier 4 of the Dynamic Agent Team below,
+exactly like Verifier and Debate already are. Web Search +
 Web Fetch tools + tool-execution loop (`app/tools/` — `base.py`'s
 `ExecutableTool` Protocol, `web_search.py`'s and `web_fetch.py`'s
 Tavily-backed implementations, `registry.py`, `factory.py`;
@@ -1896,10 +1971,17 @@ the dependency order explained above, each with its own review checkpoint.
 
 ## What's not implemented yet
 
-Also still open: multi-turn agent loops,
-tool-using agents that act on a plan's own intermediate results mid-run
-rather than a single forced-JSON planning call up front, plugin loader,
-network failover/VPN layer, and PostgreSQL migration. Tools now cover
+Also still open: plugin loader, network failover/VPN layer, and
+PostgreSQL migration. Adaptive mid-run planning now closes what used to
+be listed here as "multi-turn agent loops, tool-using agents that act on
+a plan's own intermediate results mid-run rather than a single
+forced-JSON planning call up front" — `PlanRequest.adaptive` (opt-in,
+off by default) lets a round of DAG nodes' real completed outputs feed
+back into the Planner for a bounded number of incremental continuation
+rounds, appending only the new steps it decides are still needed rather
+than discarding and regenerating the whole plan (that's still what
+`verify`'s replan loop does, on purpose — see the Planner section above
+for both and how they compose). Tools now cover
 `web_search` *and* `web_fetch` (Tavily Extract-backed — see the Tools
 section above for why that shape was chosen over a hand-rolled fetcher
 or a Playwright-based browser), closing what used to be listed here as

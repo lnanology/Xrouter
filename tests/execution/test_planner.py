@@ -243,6 +243,63 @@ def test_validate_plan_shape_rejects_any_tool_when_none_are_available():
         _validate_plan_shape(plan, max_nodes=20, available_tools=[])
 
 
+# --- allow_empty / known_ids (adaptive-planning continuation calls) ---------
+
+def test_plan_tool_schema_min_items_is_one_by_default():
+    schema = _build_plan_tool_schema([])
+    assert schema["function"]["parameters"]["properties"]["nodes"]["minItems"] == 1
+
+
+def test_plan_tool_schema_allows_zero_nodes_when_allow_empty():
+    schema = _build_plan_tool_schema([], allow_empty=True)
+    assert schema["function"]["parameters"]["properties"]["nodes"]["minItems"] == 0
+    assert "empty" in schema["function"]["description"].lower()
+
+
+def test_validate_plan_shape_rejects_a_node_id_already_in_known_ids():
+    plan = PlanSpec(nodes=[PlanNodeSpec(id="a", prompt="hi")])
+    with pytest.raises(PlannerError, match="already used in an earlier round"):
+        _validate_plan_shape(plan, max_nodes=20, known_ids=frozenset({"a"}))
+
+
+def test_validate_plan_shape_accepts_a_dependency_on_a_known_id():
+    plan = PlanSpec(nodes=[PlanNodeSpec(id="b", depends_on=["a"], prompt="hi")])
+    _validate_plan_shape(plan, max_nodes=20, known_ids=frozenset({"a"}))  # should not raise
+
+
+@pytest.mark.asyncio
+async def test_generate_plan_allow_empty_returns_immediately_on_zero_nodes(tmp_path):
+    engine = await build_test_engine(tmp_path, {"solo": {"tool_calls": [_tool_call(_plan_json([]))]}})
+    plan_request = PlanRequest(task="continue the task", model="solo/test-model")
+
+    plan, attempts = await generate_plan(engine, plan_request, max_nodes=20, max_retries=2, allow_empty=True)
+
+    assert attempts == 1
+    assert plan.nodes == []
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 1  # no validation retry triggered by an intentionally empty plan
+
+
+@pytest.mark.asyncio
+async def test_generate_plan_known_ids_rejects_a_reused_id_and_retries(tmp_path):
+    bad_plan = _plan_json([{"id": "a", "prompt": "redo a"}])
+    good_plan = _plan_json([{"id": "a2", "prompt": "a new step"}])
+    engine = await build_test_engine(tmp_path, {"solo": {"responses": [
+        {"tool_calls": [_tool_call(bad_plan)]},
+        {"tool_calls": [_tool_call(good_plan)]},
+    ]}})
+    plan_request = PlanRequest(task="continue the task", model="solo/test-model")
+
+    plan, attempts = await generate_plan(
+        engine, plan_request, max_nodes=20, max_retries=1, known_ids=frozenset({"a"}), allow_empty=True,
+    )
+
+    assert attempts == 2
+    assert [n.id for n in plan.nodes] == ["a2"]
+    solo = engine.ctx.providers.get("solo")
+    assert "already used" in solo.last_request.messages[-1].content.lower()
+
+
 @pytest.mark.asyncio
 async def test_generate_plan_offers_only_registered_configured_tools(tmp_path):
     plan_json = _plan_json([{"id": "a", "prompt": "search for X", "enable_tools": ["web_search"]}])

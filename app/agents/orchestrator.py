@@ -307,10 +307,18 @@ async def orchestrate(engine: "ChatEngine", request: OrchestrationRequest) -> Or
     plan_request = PlanRequest(
         task=request.task, context=_augment_context_for_tier(context, hint_research=verify_tier),
         model=request.model, routing_policy=request.routing_policy, verify=verify_tier,
+        # Adaptive mid-run planning (app/execution/adaptive_planner.py) is
+        # bundled into Tier 4 ("very hard") exactly like verify and Debate
+        # already are -- gated by the same verify_tier boolean, not a
+        # separate opt-in field, since Tier 4 is already the tier whose
+        # own definition accepts extra planning/verification cost. Tier 3
+        # ("hard") is unaffected.
+        adaptive=verify_tier,
     )
     plan_result = await run_plan_with_verification(
         engine, plan_request, max_nodes=routing.max_dag_nodes,
         max_plan_retries=routing.max_plan_retries, max_verify_retries=routing.max_verify_retries,
+        max_adaptive_rounds=routing.max_adaptive_rounds,
         plan_mutator=_force_terminal_critique,
     )
 

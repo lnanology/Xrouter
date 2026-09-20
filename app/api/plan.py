@@ -42,6 +42,7 @@ async def run_plan(request: Request, body: PlanRequest):
             engine, body, max_nodes,
             max_plan_retries=ctx.settings.routing.max_plan_retries,
             max_verify_retries=ctx.settings.routing.max_verify_retries,
+            max_adaptive_rounds=ctx.settings.routing.max_adaptive_rounds,
         )
     except NoAvailableModelError as e:
         # Nothing could even answer the planning call -- same "structured
@@ -65,6 +66,6 @@ async def run_plan(request: Request, body: PlanRequest):
 
     return PlanRunResponse(
         id=new_id("plan"), plan=result.plan, plan_attempts=result.plan_attempts, dag=result.dag,
-        verification=result.verification, replan_count=result.replan_count,
+        verification=result.verification, replan_count=result.replan_count, adaptive_rounds=result.adaptive_rounds,
         latency_ms=round((time.time() - start) * 1000, 1),
     )

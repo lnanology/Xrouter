@@ -83,6 +83,14 @@ class RoutingConfig:
     # verification (PlanRequest.verify=true) can trigger a fresh
     # plan+execute cycle. Only consulted when the request opts in.
     max_verify_retries: int = 1
+    # Adaptive mid-run planning (app/execution/adaptive_planner.py):
+    # bounds how many mid-run continuation rounds a request opting into
+    # PlanRequest.adaptive=true can trigger. Only consulted when the
+    # request opts in. A continuation round is cheap relative to a full
+    # verify-triggered replan -- only the new nodes it proposes execute,
+    # nothing already done is re-run -- so a slightly higher default than
+    # max_verify_retries is reasonable while still being fully bounded.
+    max_adaptive_rounds: int = 2
     # Tool-execution loop (Phase 3): how many call -> tool -> call
     # round-trips a single node's XRouter-executed tool use may take
     # (DagNodeRequest.enable_tools) before giving up and returning
@@ -281,6 +289,7 @@ class Settings:
             planner_routing_policy=routing_raw.get("planner_routing_policy", "quality"),
             max_plan_retries=int(routing_raw.get("max_plan_retries", 2)),
             max_verify_retries=int(routing_raw.get("max_verify_retries", 1)),
+            max_adaptive_rounds=int(routing_raw.get("max_adaptive_rounds", 2)),
             max_tool_iterations=int(routing_raw.get("max_tool_iterations", 3)),
             max_critique_retries=int(routing_raw.get("max_critique_retries", 1)),
             task_aware_policy=bool(routing_raw.get("task_aware_policy", True)),

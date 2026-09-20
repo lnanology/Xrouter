@@ -26,6 +26,15 @@ class PlanRequest(BaseModel):
     # Planner re-plans with the verifier's feedback folded in and the
     # whole thing re-runs, up to routing.max_verify_retries times.
     verify: bool = False
+    # Adaptive mid-run planning (app/execution/adaptive_planner.py): off
+    # by default, same "must not turn on silently" reasoning as verify --
+    # each round it triggers is an extra planning call plus whatever new
+    # nodes it produces. Unlike verify's all-or-nothing replan, this
+    # incrementally asks the Planner (with the real, completed node
+    # outputs so far as context) whether more steps are needed, and if
+    # so appends and runs only those new steps -- nothing already done is
+    # discarded or re-run. Bounded by routing.max_adaptive_rounds.
+    adaptive: bool = False
 
 
 class PlanNodeSpec(BaseModel):
@@ -72,4 +81,5 @@ class PlanRunResponse(BaseModel):
     dag: DagRunResponse
     verification: VerificationResult | None = None   # set only when the request opted into verify=true
     replan_count: int = 0        # how many times the Verifier's feedback triggered a fresh plan+execute cycle
+    adaptive_rounds: int = 0     # how many mid-run continuation rounds actually ran (only nonzero when adaptive=true)
     latency_ms: float

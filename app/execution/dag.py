@@ -58,7 +58,15 @@ class DagValidationError(XRouterError):
     never burns a single provider call."""
 
 
-def _validate_and_order(nodes: list[DagNodeRequest], max_nodes: int) -> list[list[DagNodeRequest]]:
+def _validate_and_order(
+    nodes: list[DagNodeRequest], max_nodes: int, known_ids: frozenset[str] = frozenset(),
+) -> list[list[DagNodeRequest]]:
+    """known_ids are ids already resolved in an earlier adaptive-planning
+    round (see app/execution/adaptive_planner.py) -- a dependency on one
+    of them is valid even though it isn't in `nodes` itself, and it never
+    counts toward a node's in-degree (it's already satisfied). Empty by
+    default, so every existing call site (a plain DagRunRequest, or the
+    Planner's own shape validation) behaves exactly as before."""
     if not nodes:
         raise DagValidationError("A DAG run needs at least one node.")
     if len(nodes) > max_nodes:
@@ -74,14 +82,15 @@ def _validate_and_order(nodes: list[DagNodeRequest], max_nodes: int) -> list[lis
         for dep in n.depends_on:
             if dep == n.id:
                 raise DagValidationError(f"Node '{n.id}' cannot depend on itself.")
-            if dep not in by_id:
+            if dep not in by_id and dep not in known_ids:
                 raise DagValidationError(f"Node '{n.id}' depends on unknown node '{dep}'.")
 
-    in_degree = {n.id: len(n.depends_on) for n in nodes}
+    in_degree = {n.id: len([d for d in n.depends_on if d not in known_ids]) for n in nodes}
     dependents: dict[str, list[str]] = {n.id: [] for n in nodes}
     for n in nodes:
         for dep in n.depends_on:
-            dependents[dep].append(n.id)
+            if dep not in known_ids:
+                dependents[dep].append(n.id)
 
     waves: list[list[DagNodeRequest]] = []
     remaining = dict(in_degree)
@@ -132,12 +141,19 @@ class DagExecutor:
         self._max_tool_iterations = max_tool_iterations
         self._max_critique_retries = max_critique_retries
 
-    async def run(self, dag: DagRunRequest) -> DagRunResponse:
+    async def run(self, dag: DagRunRequest, seed_outputs: dict[str, str] | None = None) -> DagRunResponse:
+        """seed_outputs, when given, are the real, already-completed
+        outputs of nodes from an earlier adaptive-planning round (not
+        part of this call's own `dag.nodes`) -- they seed `{{node_id}}`
+        substitution and count as already-resolved dependencies (see
+        `_validate_and_order`'s `known_ids`), but are never re-executed.
+        None (the default) is identical to today's behavior."""
         start = time.time()
-        waves = _validate_and_order(dag.nodes, self._max_nodes)
+        seed_outputs = seed_outputs or {}
+        waves = _validate_and_order(dag.nodes, self._max_nodes, known_ids=frozenset(seed_outputs))
 
         results: dict[str, DagNodeResult] = {}
-        outputs: dict[str, str] = {}
+        outputs: dict[str, str] = dict(seed_outputs)
         unavailable: set[str] = set()  # failed or skipped — anything depending on these gets skipped too
 
         for wave in waves:

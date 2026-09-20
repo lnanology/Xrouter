@@ -57,6 +57,21 @@ def test_cycle_rejected():
         _validate_and_order([_node("a", ["b"]), _node("b", ["a"])], max_nodes=20)
 
 
+# --- known_ids (adaptive-planning continuation rounds) -----------------------
+
+def test_known_ids_satisfies_a_dependency_not_in_this_nodes_list():
+    # "prior" isn't in the node list passed here at all -- it's a
+    # stand-in for a node that already completed in an earlier adaptive
+    # round -- but it's accepted as a valid, already-resolved dependency.
+    waves = _validate_and_order([_node("a", ["prior"])], max_nodes=20, known_ids=frozenset({"prior"}))
+    assert [n.id for n in waves[0]] == ["a"]
+
+
+def test_unknown_dependency_still_rejected_when_not_in_known_ids():
+    with pytest.raises(DagValidationError, match="unknown node"):
+        _validate_and_order([_node("a", ["ghost"])], max_nodes=20, known_ids=frozenset({"prior"}))
+
+
 # --- pure substitution -------------------------------------------------------
 
 def test_substitute_replaces_known_placeholder():
@@ -85,6 +100,22 @@ async def test_linear_chain_substitutes_upstream_output(tmp_path):
     assert result.status == "success"
     assert [n.status for n in result.nodes] == ["success", "success"]
     solo = engine.ctx.providers.get("solo")
+    assert solo.last_request.messages[0].content == "Translate Paris to Spanish"
+
+
+@pytest.mark.asyncio
+async def test_seed_outputs_substitutes_a_prior_rounds_output_without_rerunning_it(tmp_path):
+    # "capital" is never in this run's own dag.nodes -- it stands in for
+    # a node an earlier adaptive-planning round already completed. It
+    # should be usable for {{capital}} substitution and as a satisfied
+    # dependency, without costing a provider call of its own.
+    engine = await build_test_engine(tmp_path, {"solo": {"content": "Hola"}})
+    dag = DagRunRequest(nodes=[_node("translate", depends_on=["capital"], content="Translate {{capital}} to Spanish")])
+    result = await DagExecutor(engine).run(dag, seed_outputs={"capital": "Paris"})
+
+    assert result.status == "success"
+    solo = engine.ctx.providers.get("solo")
+    assert solo.call_count == 1  # only "translate" ran -- "capital" was seeded, not re-executed
     assert solo.last_request.messages[0].content == "Translate Paris to Spanish"
 
 

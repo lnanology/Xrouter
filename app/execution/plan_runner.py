@@ -6,7 +6,15 @@ re-running, up to max_verify_retries times, if not. This is the one place
 that wires Planner, DagExecutor and Verifier together; app/api/plan.py is
 a thin HTTP wrapper around it, and tests exercise it directly against a
 FakeProvider-backed engine the same way tests/execution/test_dag.py and
-test_planner.py exercise their own pieces."""
+test_planner.py exercise their own pieces.
+
+If plan_request.adaptive is set, each generated plan's nodes are run
+through app/execution/adaptive_planner.py's run_adaptive_plan() instead
+of a single DagExecutor.run() call -- an incremental "act on real
+mid-run results" loop bounded by max_adaptive_rounds, orthogonal to (and
+composable with) the verify/replan loop below, which still evaluates the
+adaptive-grown plan's final merged result exactly as it would a plain
+one."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,6 +23,7 @@ from typing import TYPE_CHECKING, Callable
 from app.contracts.dag import DagRunResponse
 from app.contracts.planner import PlanRequest, PlanSpec
 from app.contracts.verifier import VerificationResult
+from app.execution.adaptive_planner import run_adaptive_plan
 from app.execution.dag import DagExecutor
 from app.intelligence.planner import generate_plan, to_dag_request
 from app.intelligence.verifier import verify
@@ -32,6 +41,7 @@ class PlanRunResult:
     dag: DagRunResponse
     verification: VerificationResult | None
     replan_count: int
+    adaptive_rounds: int = 0
 
 
 def _augment_context(context: str | None, feedback: str) -> str:
@@ -44,7 +54,8 @@ def _augment_context(context: str | None, feedback: str) -> str:
 
 async def run_plan_with_verification(
     engine: "ChatEngine", plan_request: PlanRequest, max_nodes: int,
-    max_plan_retries: int, max_verify_retries: int, plan_mutator: PlanMutator | None = None,
+    max_plan_retries: int, max_verify_retries: int, max_adaptive_rounds: int = 2,
+    plan_mutator: PlanMutator | None = None,
 ) -> PlanRunResult:
     """max_verify_retries only actually bounds anything when
     plan_request.verify is True -- see PlanRequest.verify's docstring for
@@ -55,13 +66,20 @@ async def run_plan_with_verification(
     executor, propagate untouched -- the API layer (app/api/plan.py)
     turns each into the appropriate structured HTTP error.
 
+    max_adaptive_rounds similarly only bounds anything when
+    plan_request.adaptive is True (see app/execution/adaptive_planner.py);
+    it defaults to 2 so existing callers that never set adaptive=True are
+    unaffected either way.
+
     plan_mutator, when given, is applied to every freshly generated plan
-    (including each re-plan) right before it's converted to a DagRunRequest
-    and executed -- e.g. app/agents/orchestrator.py uses it to force
-    critique=true onto a plan's terminal nodes for its higher-complexity
-    tiers, without duplicating this whole loop just to add one
-    deterministic tweak. None (the default) leaves a generated plan
-    completely untouched, matching every existing POST /v1/plan/run call."""
+    (including each re-plan, and -- when adaptive is set -- each adaptive
+    continuation round's own mini-plan) right before it's converted to a
+    DagRunRequest and executed -- e.g. app/agents/orchestrator.py uses it
+    to force critique=true onto a plan's terminal nodes for its
+    higher-complexity tiers, without duplicating this whole loop just to
+    add one deterministic tweak. None (the default) leaves a generated
+    plan completely untouched, matching every existing POST /v1/plan/run
+    call."""
     current = plan_request
     verification: VerificationResult | None = None
     replan_count = 0
@@ -71,20 +89,30 @@ async def run_plan_with_verification(
         plan, plan_attempts = await generate_plan(engine, current, max_nodes, max_retries=max_plan_retries)
         if plan_mutator is not None:
             plan = plan_mutator(plan)
-        dag_result = await DagExecutor(
-            engine, max_nodes=max_nodes,
-            tools=engine.ctx.tools, max_tool_iterations=engine.ctx.settings.routing.max_tool_iterations,
-            max_critique_retries=engine.ctx.settings.routing.max_critique_retries,
-        ).run(to_dag_request(plan))
+
+        adaptive_rounds = 0
+        if plan_request.adaptive:
+            plan, dag_result, adaptive_rounds = await run_adaptive_plan(
+                engine, current, plan, max_nodes, max_plan_retries, max_adaptive_rounds, plan_mutator=plan_mutator,
+            )
+        else:
+            dag_result = await DagExecutor(
+                engine, max_nodes=max_nodes,
+                tools=engine.ctx.tools, max_tool_iterations=engine.ctx.settings.routing.max_tool_iterations,
+                max_critique_retries=engine.ctx.settings.routing.max_critique_retries,
+            ).run(to_dag_request(plan))
 
         if not plan_request.verify:
-            return PlanRunResult(plan=plan, plan_attempts=plan_attempts, dag=dag_result, verification=None, replan_count=0)
+            return PlanRunResult(
+                plan=plan, plan_attempts=plan_attempts, dag=dag_result, verification=None,
+                replan_count=0, adaptive_rounds=adaptive_rounds,
+            )
 
         verification = await verify(engine, plan_request.task, current.context, dag_result, routing_policy=current.routing_policy)
         if verification.satisfied or replan_count >= retries_allowed:
             return PlanRunResult(
                 plan=plan, plan_attempts=plan_attempts, dag=dag_result,
-                verification=verification, replan_count=replan_count,
+                verification=verification, replan_count=replan_count, adaptive_rounds=adaptive_rounds,
             )
 
         replan_count += 1
