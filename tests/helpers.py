@@ -7,6 +7,7 @@ import asyncio
 from collections.abc import AsyncIterator
 
 from app.contracts.model import ModelInfo
+from app.contracts.plugin import PluginLoadReport
 from app.contracts.provider import ProviderCapability, ProviderConfig, ProviderHealth, ProviderStatus
 from app.contracts.request import ChatCompletionRequest
 from app.contracts.response import ChatCompletionChoice, ChatCompletionChunk, ChatCompletionChunkChoice, ChatCompletionResponse, Usage
@@ -314,6 +315,7 @@ async def build_test_engine(
         metrics_repo=metrics_repo, health_monitor=None, performance=None, tools=tools,
         memory_repo=MemoryRepository(db), benchmark_scheduler=None, ab_router=ab_router,
         policy_learner=policy_learner, evolution_engine=None, self_healer=None,
+        plugins=PluginLoadReport(),
     )
     return ChatEngine(ctx)
 

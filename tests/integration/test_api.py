@@ -264,6 +264,24 @@ def test_admin_self_healing_run_once_is_graceful_and_takes_no_action_on_a_fresh_
     assert body == {"actions": {}, "managed": []}
 
 
+def test_admin_plugins_requires_auth(client):
+    resp = client.get("/admin/plugins")
+    assert resp.status_code == 401
+
+
+def test_admin_plugins_reports_the_real_running_config(client):
+    # The real config/plugins.yaml ships with plugins: {} (opt-in only --
+    # a plugin runs arbitrary imported code, so this must never load
+    # anything by default), so a fresh app's report is empty on both
+    # sides -- safe to assert the specific shape, same reasoning as
+    # Evolution Engine/Self-Healing's own "fresh engine" admin tests above.
+    ctx = app.state.context
+    token = ctx.settings.server.admin_token
+    resp = client.get("/admin/plugins", headers={"Authorization": f"Bearer {token}"})
+    assert resp.status_code == 200
+    assert resp.json() == {"loaded": [], "failed": {}}
+
+
 def test_request_body_too_large_rejected(client):
     from app.core.config import get_settings
 

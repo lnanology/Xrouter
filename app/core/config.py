@@ -13,6 +13,7 @@ from typing import Any
 import yaml
 from dotenv import load_dotenv
 
+from app.contracts.plugin import PluginManifest
 from app.contracts.provider import ProviderConfig
 
 CONFIG_DIR = Path(os.environ.get("XROUTER_CONFIG_DIR", Path(__file__).resolve().parents[2] / "config"))
@@ -249,6 +250,7 @@ class Settings:
     raw_routing: dict[str, Any]
     model_overrides: dict[str, dict[str, Any]] = field(default_factory=dict)
     tools: dict[str, ToolConfig] = field(default_factory=dict)
+    plugins: dict[str, PluginManifest] = field(default_factory=dict)
 
     @classmethod
     def load(cls, config_dir: Path | None = None) -> "Settings":
@@ -261,6 +263,7 @@ class Settings:
         raw_models = _load_yaml(cdir / "models.yaml")
         model_overrides = raw_models.get("models", {}) or {}
         raw_tools = _load_yaml(cdir / "tools.yaml")
+        raw_plugins = _load_yaml(cdir / "plugins.yaml")
 
         server_raw = raw_config.get("server", {})
         server = ServerConfig(
@@ -376,6 +379,18 @@ class Settings:
                 extra=tcfg.get("extra", {}) or {},
             )
 
+        plugins: dict[str, PluginManifest] = {}
+        for plname, plcfg in (raw_plugins.get("plugins") or {}).items():
+            plugins[plname] = PluginManifest(
+                name=plname,
+                version=plcfg.get("version", "0.0.0"),
+                module=plcfg.get("module", ""),
+                capabilities=plcfg.get("capabilities", []) or [],
+                dependencies=plcfg.get("dependencies", []) or [],
+                config=plcfg.get("config", {}) or {},
+                enabled=bool(plcfg.get("enabled", False)),
+            )
+
         if not server.admin_token:
             # Never leave /admin/* unauthenticated by default (section 三十三).
             server.admin_token = secrets.token_urlsafe(24)
@@ -389,6 +404,7 @@ class Settings:
             server=server, routing=routing, cache=cache, benchmark=benchmark, ab_routing=ab_routing,
             policy_learning=policy_learning, evolution=evolution, self_healing=self_healing, retrieval=retrieval,
             providers=providers, raw_routing=raw_routing, model_overrides=model_overrides, tools=tools,
+            plugins=plugins,
         )
 
 

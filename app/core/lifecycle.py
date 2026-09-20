@@ -10,6 +10,7 @@ from app.core.registry import ModelRegistry, ProviderRegistry
 from app.observability.events import get_event_bus
 from app.observability.logging import get_logger
 from app.observability.metrics import get_metrics
+from app.plugins.loader import load_plugins
 from app.quota.tracker import get_quota_tracker
 from app.reliability.benchmark import BenchmarkScheduler
 from app.reliability.circuit_breaker import CircuitBreakerRegistry
@@ -34,6 +35,7 @@ logger = get_logger("lifecycle")
 
 async def startup(settings: Settings | None = None) -> AppContext:
     settings = settings or get_settings()
+    plugins = load_plugins(settings)
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     db_path = str(DATA_DIR / "xrouter.sqlite3")
 
@@ -114,9 +116,10 @@ async def startup(settings: Settings | None = None) -> AppContext:
     tools = build_tool_registry(settings)
 
     logger.info(
-        "startup complete: %d provider(s) configured, %d enabled, %d model(s) discovered, %d tool(s) available",
+        "startup complete: %d provider(s) configured, %d enabled, %d model(s) discovered, %d tool(s) available, "
+        "%d plugin(s) loaded",
         len(settings.providers), sum(1 for p in settings.providers if providers.is_enabled(p)), len(models.all()),
-        len(tools.available_names()),
+        len(tools.available_names()), len(plugins.loaded),
     )
 
     return AppContext(
@@ -126,6 +129,7 @@ async def startup(settings: Settings | None = None) -> AppContext:
         metrics_repo=metrics_repo, health_monitor=health_monitor, performance=performance, tools=tools,
         memory_repo=memory_repo, benchmark_scheduler=benchmark_scheduler, ab_router=ab_router,
         policy_learner=policy_learner, evolution_engine=evolution_engine, self_healer=self_healer,
+        plugins=plugins,
     )
 
 

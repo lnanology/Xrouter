@@ -127,6 +127,15 @@ async def admin_self_healing_run_once(request: Request):
     return await ctx.self_healer.run_once()
 
 
+@router.get("/plugins", dependencies=[Depends(require_admin)])
+async def admin_plugins(request: Request):
+    """Read-back for the plugin loader (app/plugins/loader.py) -- which
+    plugins from config/plugins.yaml actually loaded at startup, and
+    why any others were skipped. See PluginLoadReport.snapshot()."""
+    ctx = request.app.state.context
+    return ctx.plugins.snapshot()
+
+
 @router.post("/reload", dependencies=[Depends(require_admin)])
 async def admin_reload(request: Request):
     ctx = request.app.state.context

@@ -1,0 +1,19 @@
+# Plugin loader (Tier 4): registers new provider/tool *types* at startup,
+# before providers.yaml/tools.yaml are parsed, via the two extension
+# points app/providers/factory.py and app/tools/factory.py already expose
+# (register_adapter / register_builder). Nothing here executes unless a
+# plugin is both listed AND enabled: true -- a plugin runs arbitrary
+# imported code, so this must never turn on silently.
+#
+# Example entry (disabled -- shown for shape only):
+#
+# plugins:
+#   my_plugin:
+#     version: "1.0.0"
+#     module: "my_package.my_plugin"   # dotted path this loader imports
+#     capabilities: ["provider:my_type"]
+#     dependencies: []                  # other plugin names that must load first
+#     config: {}                        # read back via app.plugins.loader.get_plugin_config()
+#     enabled: false
+
+plugins: {}

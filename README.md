@@ -1356,6 +1356,58 @@ a future extension point, not built ahead of need. All state (streaks,
 disabled-by-self bookkeeping) lives in memory only, scoped to one
 process — nothing here touches the database.
 
+### Plugin loader (Tier 4, opt-in: `config/plugins.yaml`)
+
+The provider and tool factories (`app/providers/factory.py`, `app/tools/
+factory.py`) were built ahead of need with a `register_adapter()` /
+`register_builder()` extension point each, specifically so a future
+plugin could add a new provider or tool *type* without editing those
+files. This piece is the loader that actually calls them: a plugin is a
+real, importable Python module declared in `config/plugins.yaml`, and
+`load_plugins()` runs as the very first statement in `startup()` —
+before `ProviderRegistry.build()` or `build_tool_registry()` consume
+those registries — so a newly-registered type is visible to both.
+
+Deliberately scoped to type-level registration only (rule against
+unnecessary infrastructure): a plugin's own top-level code calls
+`register_adapter()`/`register_builder()` during import. There's no
+instance-level `register(providers, tools)` callback, no hot-reload, no
+sandboxing, no dependency topological sort (declaration order in
+`plugins.yaml` **is** the required load order), and no PyPI/
+`entry_points` auto-discovery — none of that is needed to close the
+actual gap, which was "the two extension points exist but nothing ever
+calls them."
+
+```yaml
+# config/plugins.yaml
+plugins:
+  my_plugin:
+    version: "1.0.0"
+    module: "my_package.my_plugin"   # dotted import path
+    dependencies: []                  # other plugin names, must load first
+    config: { some_key: "some_value" }
+    enabled: false
+```
+
+Fails open per plugin, matching every other registry's contract: a
+disabled entry is skipped, an entry whose `dependencies` haven't loaded
+yet is skipped, and any exception raised while importing one plugin is
+caught and recorded — never crashes startup. A plugin reads its own
+config blob back via `app.plugins.loader.get_plugin_config(name)`,
+called from its own top-level code during import.
+
+```bash
+curl "http://localhost:20128/admin/plugins" -H "Authorization: Bearer $TOKEN"
+```
+
+```json
+{ "loaded": ["my_plugin"], "failed": { "other_plugin": "missing dependency(ies): my_plugin" } }
+```
+
+`config/plugins.yaml` ships with `plugins: {}` — a plugin runs arbitrary
+imported code, so, like every other opt-in feature in this project, it
+must never turn on silently.
+
 ## Tests
 
 ```bash
@@ -1363,9 +1415,10 @@ source .venv/bin/activate
 pytest -q
 ```
 
-520 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+534 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
-`tests/retrieval`, `tests/storage`, `tests/integration` — circuit
+`tests/retrieval`, `tests/storage`, `tests/plugins`, `tests/integration`
+— circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
 cache TTL/volatility rules, router scoring/exclusion rules, fallback
 chains (timeout/429/500/mid-stream failure), provider adapters against
@@ -1683,7 +1736,24 @@ full stack, both new `/admin/self_healing/*` routes requiring the same
 admin token as every other `/admin/*` route, `GET .../status` reporting
 `disabled_by_self_healing == {}` on a freshly built engine, and `POST
 .../run_once` returning the exact no-op shape on a fresh app whose real
-providers start healthy with a closed circuit.
+providers start healthy with a closed circuit. The Plugin loader
+(`tests/plugins/test_loader.py`, against real importable fixture modules
+`tests/fixtures/example_plugin.py`/`broken_plugin.py`, never a mocked
+import mechanism) — an enabled plugin registering a new provider type
+*and* a new tool type and reading its own config back via
+`get_plugin_config()` during its own import; a disabled plugin skipped
+and never imported at all; a plugin with an unmet dependency recorded as
+failed rather than raised; a plugin declared after its dependency in
+`plugins.yaml` loading successfully; an import error inside one plugin
+caught and recorded without blocking a later good plugin from loading; a
+missing `module` path recorded as failed; and an empty `plugins.yaml`
+producing an empty report — plus `register_builder()` itself
+(`tests/tools/test_factory.py`), `Settings.load()`'s `plugins.yaml`
+parsing (`tests/unit/test_config_plugins.py` — missing file defaults to
+empty, a full entry's every field round-trips, `enabled` defaults to
+`False` when omitted), and, full stack, `GET /admin/plugins` requiring
+the same admin token as every other `/admin/*` route and reporting the
+real (empty-by-default) `{"loaded": [], "failed": {}}` shape.
 
 Verified end-to-end against real hardware: real Ollama (non-streaming and
 `stream=true`, both producing correctly formatted chunks/`[DONE]`), and a
@@ -1969,10 +2039,21 @@ Phase 5 is now complete: all five pieces (Automated Benchmark, A/B
 Routing, Policy Learning, Evolution Engine, Self-healing) are shipped, in
 the dependency order explained above, each with its own review checkpoint.
 
+Beyond the numbered phases, Tier 4 of the post-launch gap list adds a
+Plugin loader (`app/plugins/loader.py`, opt-in via `config/plugins.yaml`)
+— see the Plugin loader section above. It closes the loop on two
+extension points (`register_adapter`/`register_builder`) the provider and
+tool factories already exposed ahead of need, deliberately scoped to
+type-level registration only.
+
 ## What's not implemented yet
 
-Also still open: plugin loader, network failover/VPN layer, and
-PostgreSQL migration. Adaptive mid-run planning now closes what used to
+Also still open: network failover/VPN layer and PostgreSQL migration —
+both are explicitly build-only-when-actually-needed, not scheduled
+ahead of a real requirement. Plugin loader now closes what used to be
+listed here as "plugin loader" — see the Plugin loader section above for
+the design and its deliberate scope (type-level registration only).
+Adaptive mid-run planning now closes what used to
 be listed here as "multi-turn agent loops, tool-using agents that act on
 a plan's own intermediate results mid-run rather than a single
 forced-JSON planning call up front" — `PlanRequest.adaptive` (opt-in,
@@ -1997,10 +2078,9 @@ has already reached the client chunk by chunk by the time it could be
 assessed, so there's nothing left to retry; see
 `app/intelligence/quality_gate.py`'s docstring and the Quality gate
 section above for the full reasoning and the alternatives considered).
-Their directories exist as reserved, empty packages
-(`app/execution/cancellation.py`, `app/network`, `app/plugins`) so the
-rest of Phase 5+ has a home without restructuring what's already
-built.
+Network failover/VPN layer's directory exists as a reserved, empty
+package (`app/network`) so it has a home without restructuring what's
+already built, once it's actually needed.
 
 ## Project layout
 

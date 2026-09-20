@@ -27,6 +27,14 @@ _BUILDERS = {
 }
 
 
+def register_builder(type_key: str, builder) -> None:
+    """Allows plugins to register new tool types without editing this
+    file -- the tools-side counterpart to
+    app.providers.factory.register_adapter(). Called by
+    app/plugins/loader.py while importing a plugin module."""
+    _BUILDERS[type_key] = builder
+
+
 def build_tool_registry(settings: Settings) -> ToolRegistry:
     registry = ToolRegistry()
     for tool_id, cfg in settings.tools.items():

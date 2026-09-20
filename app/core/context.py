@@ -7,6 +7,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from app.cache.manager import CacheManager
+from app.contracts.plugin import PluginLoadReport
 from app.core.config import Settings
 from app.core.registry import ModelRegistry, ProviderRegistry
 from app.observability.events import EventBus
@@ -57,3 +58,4 @@ class AppContext:
     policy_learner: PolicyLearner
     evolution_engine: EvolutionEngine
     self_healer: SelfHealer
+    plugins: PluginLoadReport

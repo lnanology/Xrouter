@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from app.core.config import ToolConfig
-from app.tools.factory import build_tool_registry
+from app.tools.factory import build_tool_registry, register_builder
 from app.tools.web_fetch import WebFetchTool
 from app.tools.web_search import WebSearchTool
 
@@ -89,3 +89,37 @@ def test_build_registry_one_bad_tool_does_not_break_the_others(monkeypatch):
         factory_module._BUILDERS.update(original_builders)
 
     assert registry.available_names() == ["web_search"]
+
+
+def test_register_builder_adds_a_new_tool_type_usable_by_build_tool_registry():
+    # the plugin-loader-facing hook (app/plugins/loader.py calls this
+    # symmetric to app.providers.factory.register_adapter)
+    from app.tools import factory as factory_module
+
+    class PluginTool:
+        name = "plugin_tool"
+        schema: dict = {"type": "function", "function": {"name": "plugin_tool"}}
+
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        @property
+        def configured(self) -> bool:
+            return True
+
+        async def execute(self, arguments: dict) -> str:
+            return "ok"
+
+        async def close(self) -> None:
+            pass
+
+    original_builders = dict(factory_module._BUILDERS)
+    try:
+        register_builder("plugin_tool", lambda cfg: PluginTool(cfg))
+        settings = _settings({"plugin_tool": ToolConfig(id="plugin_tool", enabled=True)})
+        registry = build_tool_registry(settings)
+        assert registry.available_names() == ["plugin_tool"]
+        assert isinstance(registry.get("plugin_tool"), PluginTool)
+    finally:
+        factory_module._BUILDERS.clear()
+        factory_module._BUILDERS.update(original_builders)
