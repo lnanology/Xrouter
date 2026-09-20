@@ -2,6 +2,7 @@ from types import SimpleNamespace
 
 from app.core.config import ToolConfig
 from app.tools.factory import build_tool_registry
+from app.tools.web_fetch import WebFetchTool
 from app.tools.web_search import WebSearchTool
 
 
@@ -43,6 +44,17 @@ def test_build_registry_tool_stays_unconfigured_without_api_key(monkeypatch):
     # enabled in config but no API key present -> gracefully absent, not a crash
     assert registry.available_names() == []
     assert registry.get("web_search") is None
+
+
+def test_build_registry_builds_a_configured_web_fetch_tool(monkeypatch):
+    monkeypatch.setenv("FAKE_KEY", "sk-1")
+    settings = _settings({
+        "web_fetch": ToolConfig(id="web_fetch", enabled=True, api_key_env="FAKE_KEY", base_url="https://x.example.com"),
+    })
+    registry = build_tool_registry(settings)
+    assert registry.available_names() == ["web_fetch"]
+    tool = registry.get("web_fetch")
+    assert isinstance(tool, WebFetchTool)
 
 
 def test_build_registry_skips_unknown_tool_id_without_crashing(monkeypatch):

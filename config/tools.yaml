@@ -14,3 +14,14 @@ tools:
     api_key_env: "TAVILY_API_KEY"
     base_url: "https://api.tavily.com"
     timeout_seconds: 10
+
+  # Reads one page in full (Tavily's Extract API) -- the complement to
+  # web_search, which only returns short snippets. Same TAVILY_API_KEY
+  # covers both; a node still has to list "web_fetch" in its own
+  # enable_tools before it's ever called, so enabling it here costs
+  # nothing by itself.
+  web_fetch:
+    enabled: true
+    api_key_env: "TAVILY_API_KEY"
+    base_url: "https://api.tavily.com"
+    timeout_seconds: 15

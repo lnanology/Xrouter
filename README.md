@@ -18,8 +18,9 @@ substitution — plus all of **Phase 3** (multi-agent orchestration): a
 Planner that turns a single free-form task into an explicit DAG (an
 actual LLM call, not a fixed template) and runs it through that same DAG
 executor, a Verifier that closes the plan → execute → verify loop, a
-real, config-driven Web Search tool (Tavily-backed) that a DAG/Planner
-node can invoke through an XRouter-executed call → tool → call loop —
+real, config-driven Web Search + Web Fetch tools (both Tavily-backed)
+that a DAG/Planner node can invoke through an XRouter-executed call →
+tool → call loop —
 not a fake placeholder that just echoes the query back — a Critic that
 reviews a single node's own output against its own instruction and
 reruns that node if unsatisfied, distinct from the Verifier's once-at-
@@ -313,7 +314,7 @@ an empty node list, more than `routing.max_dag_nodes` nodes (default
 `20`), duplicate ids, a self-dependency, an unknown dependency, or a cycle
 all return `400` with a structured `xrouter_error` body.
 
-### Tools (XRouter-executed, e.g. Web Search)
+### Tools (XRouter-executed, e.g. Web Search, Web Fetch)
 
 A DAG/Planner node can opt into a real, XRouter-executed tool by name via
 `"enable_tools": ["web_search"]` on that node — distinct from the plain
@@ -348,14 +349,58 @@ as that tool call's own result (`"Tool error: ..."`) rather than failing
 the node outright — the model can often recover by rephrasing or
 answering without it.
 
-Currently one tool ships: **`web_search`** (`app/tools/web_search.py`),
-backed by [Tavily](https://tavily.com)'s search API — set `TAVILY_API_KEY`
-in `.env` and `tools.web_search.enabled: true` in `config/tools.yaml`
-(the default) to turn it on. Adding a new tool type means writing one
-class implementing `app/tools/base.py`'s `ExecutableTool` Protocol
-(`name`, `schema`, `configured`, async `execute()`, async `close()`) and
-registering a builder in `app/tools/factory.py` — no other code needs to
-change, same pattern as adding a provider adapter.
+Two tools ship today, both backed by [Tavily](https://tavily.com) — one
+`TAVILY_API_KEY` covers both:
+
+- **`web_search`** (`app/tools/web_search.py`) — Tavily's search API,
+  returns a short list of relevant results (title, url, snippet).
+- **`web_fetch`** (`app/tools/web_fetch.py`) — Tavily's *Extract* API,
+  reads one specific URL in full and returns its extracted text. The
+  natural complement to `web_search`: search finds candidate URLs,
+  `web_fetch` reads one of them in full once a snippet isn't enough. Not
+  a real browser — there's no JS execution or screenshots, Tavily's own
+  extraction handles page rendering server-side. A node can enable both
+  at once (`"enable_tools": ["web_search", "web_fetch"]`); `tool_loop.py`
+  offers whichever are registered and configured, and the model picks.
+
+```bash
+curl http://localhost:20128/v1/dag/run \
+  -H "Content-Type: application/json" \
+  -d '{
+    "nodes": [
+      {"id": "research", "enable_tools": ["web_search", "web_fetch"],
+       "messages": [{"role": "user", "content": "Find XRouter'"'"'s GitHub repo and summarize its README."}]}
+    ]
+  }'
+```
+
+Both are on by default (`tools.web_search.enabled` / `tools.web_fetch.
+enabled: true` in `config/tools.yaml`) — set `TAVILY_API_KEY` in `.env`
+to actually turn them on; with no key, each stays gracefully absent
+(`configured` is `False`, so `ToolRegistry.get()` returns `None`), the
+same rule a provider with no API key follows. Registering a tool this
+way costs nothing by itself: a node still has to list it in
+`enable_tools` *and* the model still has to choose to call it before any
+real request happens.
+
+`web_fetch` was chosen deliberately over two other shapes for what
+README used to call a bare "browser/web-AI adapter" bullet with no
+further spec anywhere in the repo: a hand-rolled `httpx` GET + stdlib
+HTML stripper (zero dependency, but no JS rendering and weaker
+extraction) and real Playwright browser automation (a true "browser",
+but a large new dependency plus browser binaries for a single optional
+tool — disproportionate infrastructure). Tavily Extract reuses the exact
+`TAVILY_API_KEY`/`httpx`-only integration `web_search` already
+established — zero new dependency, zero new secret — while still doing
+real server-side page extraction rather than a heuristic.
+
+Adding a new tool type means writing one class implementing
+`app/tools/base.py`'s `ExecutableTool` Protocol (`name`, `schema`,
+`configured`, async `execute()`, async `close()`) and registering a
+builder in `app/tools/factory.py` — no other code needs to change, same
+pattern as adding a provider adapter; `web_fetch` itself needed no
+changes to `ToolRegistry`, `tool_loop.py`, or `DagNodeRequest`/
+`PlanNodeSpec`, confirming the extension point already generalizes.
 
 ### Critic (opt-in per node: `"critique": true`)
 
@@ -1269,7 +1314,7 @@ source .venv/bin/activate
 pytest -q
 ```
 
-484 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+500 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
 `tests/retrieval`, `tests/storage`, `tests/integration` — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
@@ -1330,7 +1375,13 @@ the second planning call's prompt, and giving up after exhausting
 degradation, missing/non-string query rejection, result formatting,
 empty-results text, `max_results` clamping and invalid-value fallback, and
 non-200/timeout/connection-error handling, all against a mocked Tavily
-endpoint via `respx` — never a real network call), the tool registry
+endpoint via `respx` — never a real network call), the Web Fetch tool
+(`tests/tools/test_web_fetch.py` — the same configured/unconfigured and
+transport-failure coverage, plus a missing/non-string `url` rejected, the
+`Authorization: Bearer` header and `urls` body actually sent, a long
+page truncated to `_MAX_CONTENT_CHARS`, an empty `raw_content` returning
+friendly text, and a per-URL `failed_results` entry surfaced as the
+error even on an overall HTTP 200), the tool registry
 (`tests/tools/test_registry.py` — unregistered vs. registered-but-
 unconfigured both resolving to `None`, `available_names()` filtering, and
 `close_all()` tolerating one tool's shutdown failing without blocking the
@@ -1661,13 +1712,14 @@ plan+execute cycle, up to `routing.max_verify_retries` times, via
 DagExecutor + Verifier together (`POST /v1/plan/run` is a thin HTTP
 wrapper around it). Fails open (missing/malformed tool call, or no
 provider able to answer at all counts as "satisfied") so a best-effort
-check can never hold an already-completed result hostage. Web Search tool
-+ tool-execution loop (`app/tools/` — `base.py`'s `ExecutableTool`
-Protocol, `web_search.py`'s Tavily-backed implementation, `registry.py`,
-`factory.py`; `app/execution/tool_loop.py`) — a real, config-driven tool a
-DAG/Planner node opts into via `enable_tools`, executed by XRouter itself
-in a bounded call → tool → call loop (`routing.max_tool_iterations`) on
-top of the existing `ChatEngine.handle_chat()`, never a fake placeholder
+check can never hold an already-completed result hostage. Web Search +
+Web Fetch tools + tool-execution loop (`app/tools/` — `base.py`'s
+`ExecutableTool` Protocol, `web_search.py`'s and `web_fetch.py`'s
+Tavily-backed implementations, `registry.py`, `factory.py`;
+`app/execution/tool_loop.py`) — real, config-driven tools a DAG/Planner
+node opts into via `enable_tools`, executed by XRouter itself in a
+bounded call → tool → call loop (`routing.max_tool_iterations`) on top
+of the existing `ChatEngine.handle_chat()`, never a fake placeholder
 that echoes the query back; a tool call for anything not registered and
 configured is left untouched for the client to handle. The Planner's
 `submit_plan` schema now also offers a per-node `routing_policy` override
@@ -1844,14 +1896,17 @@ the dependency order explained above, each with its own review checkpoint.
 
 ## What's not implemented yet
 
-Also still open: other tool types beyond
-`web_search`, multi-turn agent loops,
+Also still open: multi-turn agent loops,
 tool-using agents that act on a plan's own intermediate results mid-run
 rather than a single forced-JSON planning call up front, plugin loader,
-browser/web-AI adapter, network failover/VPN layer, and PostgreSQL
-migration. Memory/RAG now has a real embeddings-backed `Retriever`
-(opt-in, off by default — see the Memory/RAG section above) alongside
-the always-on keyword one. Race mode covers streaming
+network failover/VPN layer, and PostgreSQL migration. Tools now cover
+`web_search` *and* `web_fetch` (Tavily Extract-backed — see the Tools
+section above for why that shape was chosen over a hand-rolled fetcher
+or a Playwright-based browser), closing what used to be listed here as
+"other tool types" and "browser/web-AI adapter". Memory/RAG now has a
+real embeddings-backed `Retriever` (opt-in, off by default — see the
+Memory/RAG section above) alongside the always-on keyword one. Race mode
+covers streaming
 too, and the Quality Gate now has an opt-in LLM-graded judgment layer on
 top of its structural checks (see above for both) — the quality gate as a
 whole remains **deliberately** non-streaming-only regardless, structural

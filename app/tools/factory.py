@@ -9,6 +9,7 @@ from __future__ import annotations
 from app.core.config import Settings, ToolConfig
 from app.observability.logging import get_logger
 from app.tools.registry import ToolRegistry
+from app.tools.web_fetch import WebFetchTool
 from app.tools.web_search import WebSearchTool
 from app.utils.secrets import read_secret
 
@@ -16,6 +17,10 @@ logger = get_logger("tools.factory")
 
 _BUILDERS = {
     "web_search": lambda cfg: WebSearchTool(
+        api_key=read_secret(cfg.api_key_env), base_url=cfg.base_url or "https://api.tavily.com",
+        timeout_seconds=cfg.timeout_seconds,
+    ),
+    "web_fetch": lambda cfg: WebFetchTool(
         api_key=read_secret(cfg.api_key_env), base_url=cfg.base_url or "https://api.tavily.com",
         timeout_seconds=cfg.timeout_seconds,
     ),
