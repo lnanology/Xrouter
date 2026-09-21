@@ -2048,40 +2048,30 @@ type-level registration only.
 
 ## What's not implemented yet
 
-Also still open: network failover/VPN layer and PostgreSQL migration —
-both are explicitly build-only-when-actually-needed, not scheduled
-ahead of a real requirement. Plugin loader now closes what used to be
-listed here as "plugin loader" — see the Plugin loader section above for
-the design and its deliberate scope (type-level registration only).
-Adaptive mid-run planning now closes what used to
-be listed here as "multi-turn agent loops, tool-using agents that act on
-a plan's own intermediate results mid-run rather than a single
-forced-JSON planning call up front" — `PlanRequest.adaptive` (opt-in,
-off by default) lets a round of DAG nodes' real completed outputs feed
-back into the Planner for a bounded number of incremental continuation
-rounds, appending only the new steps it decides are still needed rather
-than discarding and regenerating the whole plan (that's still what
-`verify`'s replan loop does, on purpose — see the Planner section above
-for both and how they compose). Tools now cover
-`web_search` *and* `web_fetch` (Tavily Extract-backed — see the Tools
-section above for why that shape was chosen over a hand-rolled fetcher
-or a Playwright-based browser), closing what used to be listed here as
-"other tool types" and "browser/web-AI adapter". Memory/RAG now has a
-real embeddings-backed `Retriever` (opt-in, off by default — see the
-Memory/RAG section above) alongside the always-on keyword one. Race mode
-covers streaming
-too, and the Quality Gate now has an opt-in LLM-graded judgment layer on
-top of its structural checks (see above for both) — the quality gate as a
-whole remains **deliberately** non-streaming-only regardless, structural
-or LLM-graded — not a gap, a permanent scope decision (a streamed response
-has already reached the client chunk by chunk by the time it could be
-assessed, so there's nothing left to retry; see
-`app/intelligence/quality_gate.py`'s docstring and the Quality gate
-section above for the full reasoning and the alternatives considered).
-Network failover/VPN layer's directory exists as a reserved, empty
-package (`app/network`) so it has a home without restructuring what's
-already built, once it's actually needed.
+Two things are intentionally left for later, both under a "build only
+when there's a real need, not on a fixed schedule" rule: a network
+failover/VPN layer, and a PostgreSQL migration (XRouter runs on a single
+SQLite file today, which suits a single-process deployment fine with
+zero extra infrastructure to run). Both already have a reserved, empty
+package in place (`app/network` for the former) so they have a home
+without restructuring anything once they're actually needed.
+
+One more thing is worth calling out because it can look like a gap at
+first glance but isn't: the Quality Gate (both the structural checks and
+the opt-in LLM-graded layer) is deliberately non-streaming-only,
+permanently — not a TODO. A streamed response has already reached the
+client chunk by chunk by the time it could be assessed, so there's
+nothing left to retry. See `app/intelligence/quality_gate.py`'s
+docstring and the Quality gate section above for the full reasoning.
+
+Everything else described in this README — all of Phase 1 through Phase
+5, and every item on the post-launch gap list (Tiers 1-4, including the
+Plugin loader) — is built, tested, and running.
 
 ## Project layout
 
 See the full tree below (or run `find app config scripts tests -type f`).
+
+## License
+
+MIT — see [LICENSE](LICENSE).
