@@ -1,0 +1,46 @@
+This directory vendors a small part of the Berkeley Function-Calling
+Leaderboard (BFCL), part of the Gorilla project:
+
+    Source:  https://github.com/ShishirPatil/gorilla
+    Path:    berkeley-function-call-leaderboard/bfcl_eval/eval_checker/ast_eval/
+    Commit:  6ea57973c7a6097fd7c5915698c54c17c5b1b6c8 (2026-03-23)
+    License: Apache License, Version 2.0
+             https://github.com/ShishirPatil/gorilla/blob/main/LICENSE
+
+Files vendored, unmodified except where noted:
+
+    ast_checker.py                         -- 1 modification (see below)
+    type_convertor/java_type_converter.py  -- import path only
+    type_convertor/js_type_converter.py    -- import path only
+    constants.py                           -- trimmed re-creation of
+                                               bfcl_eval/constants/enums.py's
+                                               Language enum and
+                                               bfcl_eval/constants/type_mappings.py's
+                                               JAVA_TYPE_CONVERSION /
+                                               JS_TYPE_CONVERSION dicts
+                                               (the two constants these
+                                               files actually use)
+
+Why trimmed rather than a full vendor or a `pip install bfcl-eval`: the
+upstream package's own constants/model_config.py is a 2240-line registry
+of per-provider API quirks (used by ast_checker.py's convert_func_name
+to decide whether a provider's API rewrites "." to "_" in function
+names) that has no XRouter-specific entry and does not apply to how
+XRouter's own OpenAI-compatible endpoint passes tool-call function names
+through untouched. Vendoring the whole package would also pull in
+bfcl-eval's heavier transformers/openai/vllm-adjacent dependency chain
+for functionality this benchmark harness never calls. See ast_checker.py's
+convert_func_name docstring for the one line changed.
+
+The one modification: convert_func_name(function_name, model_name) was
+simplified from a MODEL_CONFIG_MAPPING[model_name] lookup to an
+unconditional passthrough, since that lookup's purpose (should "." be
+rewritten to "_" for this model's provider API) is unconditionally "no"
+for every model reachable through XRouter's endpoint.
+
+Full credit for the benchmark dataset, question design, and the AST
+matching/grading logic itself goes to the Gorilla / BFCL team at UC
+Berkeley. This harness (benchmarks/bfcl/run_benchmark.py) is XRouter's
+own code, written to drive XRouter's own /v1/chat/completions endpoint
+against this dataset using their grader, unchanged in behavior for every
+code path this harness exercises (Python-language, non-live categories).

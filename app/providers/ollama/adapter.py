@@ -3,9 +3,18 @@
 Must never prevent server startup or crash the process if Ollama is not
 installed or not running: health() reports OFFLINE and list_models()
 returns [] in that case.
+
+Tool calling: Ollama's own /api/chat wire format (confirmed against
+ollama/ollama's docs/api.md, not assumed) differs from OpenAI's in one
+specific way -- a tool_calls[].function.arguments is a *native JSON
+object* there, not a JSON-encoded string. Every place this adapter
+crosses that boundary (outgoing history replay, incoming response)
+converts explicitly so the adapter's own contract (OpenAI-compatible
+throughout XRouter) never leaks Ollama's dialect to callers.
 """
 from __future__ import annotations
 
+import json
 import time
 from collections.abc import AsyncIterator
 
@@ -19,11 +28,47 @@ from app.core.errors import ProviderConnectionError, ProviderError, ProviderServ
 from app.providers.base import Provider
 
 
+def _ollama_tool_calls_from_openai(tool_calls: list[dict]) -> list[dict]:
+    """OpenAI-style tool_calls (function.arguments is a JSON string) ->
+    Ollama-style (function.arguments is a native dict), for replaying
+    prior-turn assistant messages back into /api/chat history."""
+    out = []
+    for tc in tool_calls:
+        fn = dict(tc.get("function") or {})
+        args = fn.get("arguments")
+        if isinstance(args, str):
+            try:
+                fn["arguments"] = json.loads(args) if args else {}
+            except (json.JSONDecodeError, TypeError):
+                fn["arguments"] = {}
+        out.append({"function": fn})
+    return out
+
+
+def _openai_tool_calls_from_ollama(tool_calls: list[dict]) -> list[dict]:
+    """Reverse of the above -- Ollama's response tool_calls (native dict
+    arguments) -> OpenAI-compatible tool_calls (JSON-string arguments),
+    so every XRouter response stays genuinely OpenAI-compatible."""
+    out = []
+    for tc in tool_calls:
+        fn = dict(tc.get("function") or {})
+        args = fn.get("arguments")
+        if not isinstance(args, str):
+            fn["arguments"] = json.dumps(args if args is not None else {})
+        out.append({**tc, "function": fn})
+    return out
+
+
 def _to_ollama_messages(request: ChatCompletionRequest) -> list[dict]:
     out = []
     for m in request.messages:
         content = m.content if isinstance(m.content, str) else ("" if m.content is None else str(m.content))
-        out.append({"role": m.role, "content": content})
+        msg: dict = {"role": m.role, "content": content}
+        if m.role == "assistant" and m.tool_calls:
+            msg["tool_calls"] = _ollama_tool_calls_from_openai(m.tool_calls)
+        if m.role == "tool" and m.name:
+            msg["tool_name"] = m.name
+        out.append(msg)
     return out
 
 
@@ -35,6 +80,19 @@ class OllamaAdapter(Provider):
 
     def capabilities(self) -> set[ProviderCapability]:
         return {ProviderCapability.CHAT, ProviderCapability.STREAMING, ProviderCapability.EMBEDDINGS}
+
+    async def _supports_tools(self, name: str) -> bool:
+        """Real capability check via POST /api/show's `capabilities` field
+        (confirmed against ollama/ollama's docs/api.md), not a name-based
+        guess. Fails open to False -- a model we couldn't confirm tool
+        support for is simply not offered tools, never crashes discovery."""
+        try:
+            resp = await self._client.post("/api/show", json={"model": name}, timeout=5.0)
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception:
+            return False
+        return "tools" in (data.get("capabilities") or [])
 
     async def list_models(self) -> list[ModelInfo]:
         try:
@@ -57,7 +115,7 @@ class OllamaAdapter(Provider):
                     capabilities=["chat", "streaming"],
                     context_length=int((m.get("details") or {}).get("context_length", 8192) or 8192),
                     supports_streaming=True,
-                    supports_tools=False,
+                    supports_tools=await self._supports_tools(name),
                     supports_vision="vision" in name.lower() or "llava" in name.lower(),
                     quality_score=0.55,
                     speed_score=0.7,
@@ -95,6 +153,8 @@ class OllamaAdapter(Provider):
             "messages": _to_ollama_messages(request),
             "stream": False,
         }
+        if request.tools:
+            body["tools"] = request.tools
         if request.temperature is not None:
             body["options"] = {"temperature": request.temperature}
         try:
@@ -114,7 +174,9 @@ class OllamaAdapter(Provider):
             raise ProviderError(f"Ollama HTTP {resp.status_code}: {resp.text[:200]}", provider_id=self.id)
 
         data = resp.json()
-        message = data.get("message", {"role": "assistant", "content": ""})
+        message = dict(data.get("message") or {"role": "assistant", "content": ""})
+        if message.get("tool_calls"):
+            message["tool_calls"] = _openai_tool_calls_from_ollama(message["tool_calls"])
         prompt_tokens = int(data.get("prompt_eval_count", 0) or 0)
         completion_tokens = int(data.get("eval_count", 0) or 0)
         self._usage.tokens_total += prompt_tokens + completion_tokens
@@ -136,6 +198,8 @@ class OllamaAdapter(Provider):
             "messages": _to_ollama_messages(request),
             "stream": True,
         }
+        if request.tools:
+            body["tools"] = request.tools
         chunk_id = f"chatcmpl-{int(time.time()*1000)}"
         try:
             async with self._client.stream("POST", "/api/chat", json=body) as resp:
@@ -152,7 +216,9 @@ class OllamaAdapter(Provider):
                     if not line.strip():
                         continue
                     data = _json.loads(line)
-                    delta = data.get("message", {})
+                    delta = dict(data.get("message") or {})
+                    if delta.get("tool_calls"):
+                        delta["tool_calls"] = _openai_tool_calls_from_ollama(delta["tool_calls"])
                     finish_reason = "stop" if data.get("done") else None
                     yield ChatCompletionChunk(
                         id=chunk_id,

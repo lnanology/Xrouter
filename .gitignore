@@ -10,3 +10,8 @@ data/*.pid
 .pytest_cache/
 *.egg-info/
 .DS_Store
+
+# BFCL benchmark: ad hoc/smoke-test runs are throwaway; the run whose
+# score is actually published in the README is committed deliberately
+# as benchmarks/bfcl/results.json (the audit receipt), never this pattern.
+benchmarks/bfcl/results_*.json

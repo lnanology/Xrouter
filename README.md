@@ -1415,9 +1415,10 @@ source .venv/bin/activate
 pytest -q
 ```
 
-534 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
+553 tests across `tests/unit`, `tests/reliability`, `tests/routing`,
 `tests/execution`, `tests/providers`, `tests/tools`, `tests/agents`,
-`tests/retrieval`, `tests/storage`, `tests/plugins`, `tests/integration`
+`tests/retrieval`, `tests/storage`, `tests/plugins`, `tests/benchmarks`,
+`tests/integration`
 — circuit
 breaker state machine, bounded retry/backoff, quota risk escalation,
 cache TTL/volatility rules, router scoring/exclusion rules, fallback
@@ -2068,9 +2069,46 @@ Everything else described in this README — all of Phase 1 through Phase
 5, and every item on the post-launch gap list (Tiers 1-4, including the
 Plugin loader) — is built, tested, and running.
 
+## Agent evaluation: BFCL score
+
+XRouter's OpenAI-compatible `/v1/chat/completions` endpoint (`tools`/
+`tool_calls`, the same surface any client uses) is benchmarked against a
+1,240-item subset of the [Berkeley Function-Calling Leaderboard
+(BFCL)](https://gorilla.cs.berkeley.edu/leaderboard.html) — five
+Python-language, offline-gradeable categories (`simple_python`,
+`multiple`, `parallel`, `parallel_multiple`, `irrelevance`) covering
+single tool calls, picking the right tool among several, multiple calls
+in one turn, and correctly calling nothing when nothing applies. Grading
+uses BFCL's own AST/value-matching checker (vendored, unmodified except
+for one documented no-op simplification — no LLM judge, fully
+deterministic) against its published ground truth.
+
+This is a self-reported run of a public dataset and its own grader
+against XRouter's own endpoint — not an official BFCL leaderboard
+submission. Full methodology, category rationale, and license
+attribution: [`benchmarks/bfcl/README.md`](benchmarks/bfcl/README.md).
+
+**Reproduce it yourself, free, no API key** — this is also what made
+real Ollama tool-calling worth fixing properly (see `app/providers/ollama/adapter.py`):
+
+```bash
+ollama pull llama3.2:3b          # or any tool-calling-capable local model
+scripts/start.sh
+python3 benchmarks/bfcl/run_benchmark.py --model ollama/llama3.2:3b --out benchmarks/bfcl/results.json
+```
+
+**Score: pending the first full run.** The harness and grader above are
+built, tested (`tests/benchmarks/test_bfcl_harness.py`,
+`tests/providers/test_ollama_adapter.py`'s tool-calling coverage), and
+ready to run; a full 1,240-item run takes roughly 1-2 hours on local CPU
+inference. Once run, the score table and a link to the committed
+`benchmarks/bfcl/results.json` audit trail go here — this line is
+intentionally not a number, because rule 4 means no fabricated score
+ever ships, even a placeholder one.
+
 ## Project layout
 
-See the full tree below (or run `find app config scripts tests -type f`).
+See the full tree below (or run `find app benchmarks config scripts tests -type f`).
 
 ## License
 
