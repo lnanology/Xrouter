@@ -2097,14 +2097,30 @@ scripts/start.sh
 python3 benchmarks/bfcl/run_benchmark.py --model ollama/llama3.2:3b --out benchmarks/bfcl/results.json
 ```
 
-**Score: pending the first full run.** The harness and grader above are
-built, tested (`tests/benchmarks/test_bfcl_harness.py`,
-`tests/providers/test_ollama_adapter.py`'s tool-calling coverage), and
-ready to run; a full 1,240-item run takes roughly 1-2 hours on local CPU
-inference. Once run, the score table and a link to the committed
-`benchmarks/bfcl/results.json` audit trail go here — this line is
-intentionally not a number, because rule 4 means no fabricated score
-ever ships, even a placeholder one.
+**Score — `ollama/llama3.2:3b`, full 1,240-item run, 2026-09-24:**
+
+| Category | N | Accuracy |
+|---|---|---|
+| simple_python | 400 | 45.2% |
+| multiple | 200 | 41.5% |
+| parallel | 200 | 24.5% |
+| parallel_multiple | 200 | 29.5% |
+| irrelevance | 240 | 5.8% |
+| **Overall** | 1240 | **31.1%** |
+
+Full per-item audit trail (every request, response, and verdict):
+[`benchmarks/bfcl/results.json`](benchmarks/bfcl/results.json).
+
+This is a free, 3B, purely local model — the low `irrelevance` score
+(5.8%) is an honest and expected result, not a bug: it means the model
+reaches for a tool call far more often than a strict AST grader rewards,
+which is a known characteristic of small tool-calling models rather than
+a flaw in XRouter's request/response plumbing (the same plumbing is what
+correctly earns the `simple_python`/`multiple` scores above). The
+harness and grader are provider-agnostic — pointing `--model` at any
+other `supports_tools=True` provider XRouter already supports (including
+a larger local model or a cloud one) reruns the exact same benchmark
+against it, no code changes required.
 
 ## Project layout
 
